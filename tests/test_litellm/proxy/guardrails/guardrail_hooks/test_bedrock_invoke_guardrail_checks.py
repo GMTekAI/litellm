@@ -78,6 +78,32 @@ def test_init_empty_checks_falls_back_to_apply_mode():
     assert g.checks is None  # empty checks => ApplyGuardrail path, no conflict
 
 
+def test_normalize_checks_partial_unknown_warns_checks_mode_continues():
+    with patch(
+        "litellm.proxy.guardrails.guardrail_hooks.bedrock_guardrails.verbose_proxy_logger.warning"
+    ) as mock_warning:
+        result = BedrockGuardrail._normalize_checks(
+            {
+                "contentFilter": {"categories": [{"category": "VIOLENCE"}]},
+                "unknownCheck": {"foo": "bar"},
+            }
+        )
+    assert result == {"contentFilter": {"categories": [{"category": "VIOLENCE"}]}}
+    message = mock_warning.call_args[0][0] % tuple(mock_warning.call_args[0][1:])
+    assert "continuing in checks mode" in message
+    assert "ApplyGuardrail" not in message
+
+
+def test_normalize_checks_all_unknown_warns_apply_fallback():
+    with patch(
+        "litellm.proxy.guardrails.guardrail_hooks.bedrock_guardrails.verbose_proxy_logger.warning"
+    ) as mock_warning:
+        result = BedrockGuardrail._normalize_checks({"unknownCheck": {"foo": "bar"}})
+    assert result is None
+    message = mock_warning.call_args[0][0] % tuple(mock_warning.call_args[0][1:])
+    assert "falls back to ApplyGuardrail mode" in message
+
+
 # ---------------------------------------------------------------------------
 # Message building
 # ---------------------------------------------------------------------------

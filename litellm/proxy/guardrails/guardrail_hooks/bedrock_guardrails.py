@@ -258,19 +258,27 @@ class BedrockGuardrail(CustomGuardrail, BaseAWSLLM):
             checks = checks.model_dump(exclude_none=True)
         if not isinstance(checks, dict):
             return None
-        unknown_keys = set(checks.keys()) - _BEDROCK_CHECKS_KNOWN_KEYS
-        if unknown_keys:
-            verbose_proxy_logger.warning(
-                "BedrockGuardrail: unrecognized check key(s) %s will be ignored. "
-                "Known keys: %s. Guardrail will fall back to ApplyGuardrail mode.",
-                sorted(unknown_keys),
-                sorted(_BEDROCK_CHECKS_KNOWN_KEYS),
-            )
         cleaned = {
             key: value
             for key, value in checks.items()
             if key in _BEDROCK_CHECKS_KNOWN_KEYS and value is not None
         }
+        unknown_keys = set(checks.keys()) - _BEDROCK_CHECKS_KNOWN_KEYS
+        if unknown_keys and cleaned:
+            verbose_proxy_logger.warning(
+                "BedrockGuardrail: unrecognized check key(s) %s will be ignored; "
+                "continuing in checks mode with %s. Known keys: %s.",
+                sorted(unknown_keys),
+                sorted(cleaned.keys()),
+                sorted(_BEDROCK_CHECKS_KNOWN_KEYS),
+            )
+        elif unknown_keys:
+            verbose_proxy_logger.warning(
+                "BedrockGuardrail: unrecognized check key(s) %s will be ignored and no valid "
+                "checks remain, so the guardrail falls back to ApplyGuardrail mode. Known keys: %s.",
+                sorted(unknown_keys),
+                sorted(_BEDROCK_CHECKS_KNOWN_KEYS),
+            )
         return cleaned or None
 
     def _create_bedrock_input_content_request(
