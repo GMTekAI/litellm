@@ -110,13 +110,21 @@ def decide_credential_patch(
     if patch_access is None:
         return Deny("credential_info.access must be set for team-admin writes")
 
+    # Touching global/orgs is allowed when the value matches the stored state
+    # (the UI's edit modal sends the full access object back so unchecking
+    # revokes; a no-op resend of global=false / orgs=[] must not be rejected).
+    # Only block when the caller would actually CHANGE these.
+    existing_access = existing_info.access if existing_info is not None else None
     access_touched = frozenset(patch_access.model_fields_set)
-    if "global_" in access_touched:
+    existing_global = existing_access.global_ if existing_access is not None else False
+    existing_orgs = (
+        frozenset(existing_access.orgs) if existing_access is not None else frozenset()
+    )
+    if "global_" in access_touched and patch_access.global_ != existing_global:
         return Deny("access.global is proxy-admin only")
-    if "orgs" in access_touched:
+    if "orgs" in access_touched and frozenset(patch_access.orgs) != existing_orgs:
         return Deny("access.orgs is proxy-admin only")
 
-    existing_access = existing_info.access if existing_info is not None else None
     existing_teams = _access_teams(existing_access)
     patch_teams = _access_teams(patch_access)
 

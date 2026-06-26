@@ -146,6 +146,73 @@ class TestTeamAdminDeny:
         assert isinstance(d, Deny)
         assert "orgs" in d.reason
 
+    def test_no_op_resend_of_existing_global_is_allowed(self):
+        """The UI's Edit-access modal always sends the FULL access object
+        (so unchecking a team revokes). A non-admin re-sending the existing
+        global=false alongside their team patch must NOT be rejected as if
+        they were trying to flip the toggle.
+
+        Before this fix the decider checked only "is global_ in the patch?"
+        which broke every UI save that included the unchanged global toggle
+        plus a team edit.
+        """
+        d = _decision(
+            patch_info={
+                "access": {
+                    "global": False,
+                    "teams": ["team-A", "team-B", "team-T"],
+                    "orgs": ["org-1"],
+                }
+            }
+        )
+        assert isinstance(d, Allow)
+
+    def test_no_op_resend_of_existing_orgs_is_allowed(self):
+        """Same shape as global: a patch that includes the unchanged orgs
+        list alongside a team edit must pass."""
+        d = _decision(
+            patch_info={
+                "access": {
+                    "global": False,
+                    "teams": ["team-A", "team-B", "team-T"],
+                    "orgs": ["org-1"],
+                }
+            }
+        )
+        assert isinstance(d, Allow)
+
+    def test_attempt_to_flip_global_when_existing_is_false(self):
+        """Direct flip from stored False to True still rejected."""
+        d = _decision(
+            patch_info={"access": {"global": True, "teams": ["team-A", "team-B"]}}
+        )
+        assert isinstance(d, Deny)
+        assert "global" in d.reason
+
+    def test_attempt_to_flip_global_when_existing_is_true(self):
+        """Direct flip from stored True to False still rejected (it's still
+        a global mutation; only proxy-admin can change destination-wide reach)."""
+        existing = {
+            **_EXISTING_INFO,
+            "access": {**_EXISTING_INFO["access"], "global": True},
+        }
+        d = _decision(
+            existing_info=existing,
+            patch_info={"access": {"global": False, "teams": ["team-A", "team-B"]}},
+        )
+        assert isinstance(d, Deny)
+        assert "global" in d.reason
+
+    def test_attempt_to_change_orgs_is_rejected(self):
+        """Adding an org_id different from stored is still rejected."""
+        d = _decision(
+            patch_info={
+                "access": {"orgs": ["org-1", "org-2"], "teams": ["team-A", "team-B"]}
+            }
+        )
+        assert isinstance(d, Deny)
+        assert "orgs" in d.reason
+
     def test_adding_foreign_team_id(self):
         """foreign team_ids in the patch ARE caller input -- safe to echo."""
         d = _decision(
