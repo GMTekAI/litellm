@@ -36,7 +36,7 @@ if TYPE_CHECKING:
 
 import jwt
 from fastapi import APIRouter, Depends, Header, HTTPException, Request, status
-from fastapi.responses import RedirectResponse
+from fastapi.responses import RedirectResponse, Response
 
 import litellm
 from litellm._logging import verbose_proxy_logger
@@ -94,6 +94,7 @@ from litellm.proxy.common_utils.html_forms.ui_login import build_ui_login_form
 from litellm.proxy.common_utils.user_api_key_cache import UserApiKeyCache
 from litellm.proxy.management_endpoints.internal_user_endpoints import new_user
 from litellm.proxy.management_endpoints.sso import CustomMicrosoftSSO
+from litellm.proxy.management_endpoints.sso.saml_sso import SAMLAuthHandler
 from litellm.proxy.management_endpoints.sso_helper_utils import (
     check_is_admin_only_access,
     has_admin_ui_access,
@@ -925,6 +926,7 @@ async def google_login(
         microsoft_client_id is not None
         or google_client_id is not None
         or generic_client_id is not None
+        or SAMLAuthHandler.is_saml_configured()
     ):
         if premium_user is not True:
             # Check if under 'free SSO user' limit
@@ -980,6 +982,19 @@ async def google_login(
             raise ValueError(
                 "Enterprise features are not available. Custom UI SSO sign-in requires LiteLLM Enterprise."
             )
+
+    if (
+        microsoft_client_id is None
+        and google_client_id is None
+        and generic_client_id is None
+        and SAMLAuthHandler.is_saml_configured()
+    ):
+        verbose_proxy_logger.info("Redirecting to SAML SSO login")
+        return await SAMLAuthHandler.build_login_redirect(
+            request=request,
+            cache=user_api_key_cache,
+            relay_state=return_to,
+        )
 
     # Check if we should use SSO handler
     if (
@@ -2017,6 +2032,90 @@ async def auth_callback(request: Request, state: Optional[str] = None):
         generic_client_id=generic_client_id,
         ui_access_mode=ui_access_mode,
         access_token_payload=access_token_payload,
+        jwt_handler=jwt_handler,
+        return_to=cp_return_to,
+    )
+
+
+@router.get("/sso/saml/login", tags=["experimental"], include_in_schema=False)
+async def saml_login(request: Request, return_to: Optional[str] = None):
+    """SP-initiated SAML login. Redirects the user to the configured IdP."""
+    from litellm.proxy.proxy_server import user_api_key_cache
+
+    _disable_ui_flag = os.getenv("DISABLE_ADMIN_UI")
+    if _disable_ui_flag is not None and str_to_bool(value=_disable_ui_flag):
+        return admin_ui_disabled()
+
+    return await SAMLAuthHandler.build_login_redirect(
+        request=request, cache=user_api_key_cache, relay_state=return_to
+    )
+
+
+@router.get("/sso/saml/metadata", tags=["experimental"], include_in_schema=False)
+async def saml_metadata(request: Request):
+    """Service Provider metadata XML, for registering this proxy at the IdP."""
+    from litellm.proxy.proxy_server import user_api_key_cache
+
+    metadata = await SAMLAuthHandler.build_sp_metadata(
+        request=request, cache=user_api_key_cache
+    )
+    return Response(content=metadata, media_type="application/xml")
+
+
+@router.post("/sso/saml/callback", tags=["experimental"], include_in_schema=False)
+async def saml_callback(request: Request):
+    """Assertion Consumer Service. Validates the IdP assertion and issues a UI session."""
+    from litellm.proxy.proxy_server import (
+        general_settings,
+        jwt_handler,
+        master_key,
+        prisma_client,
+        user_api_key_cache,
+    )
+
+    if prisma_client is None:
+        raise HTTPException(
+            status_code=500, detail=CommonProxyErrors.db_not_connected_error.value
+        )
+    if master_key is None:
+        raise ProxyException(
+            message="Master Key not set for Proxy. Set `LITELLM_MASTER_KEY` in .env or general_settings:master_key in config.yaml.",
+            type=ProxyErrorTypes.auth_error,
+            param="master_key",
+            code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        )
+
+    form = await request.form()
+    saml_response = form.get("SAMLResponse")
+    relay_state = form.get("RelayState")
+    if not isinstance(saml_response, str):
+        raise HTTPException(
+            status_code=400, detail="Missing SAMLResponse in callback request."
+        )
+
+    post_data = {"SAMLResponse": saml_response}
+    if isinstance(relay_state, str):
+        post_data["RelayState"] = relay_state
+
+    result = await SAMLAuthHandler.handle_acs(
+        request=request, cache=user_api_key_cache, post_data=post_data
+    )
+
+    ui_access_mode = general_settings.get("ui_access_mode", None)
+    cp_return_to: Optional[str] = (
+        relay_state
+        if isinstance(relay_state, str)
+        and SSOAuthenticationHandler._validate_return_to(relay_state)
+        else None
+    )
+
+    return await SSOAuthenticationHandler.get_redirect_response_from_openid(
+        result=result,
+        request=request,
+        received_response=None,
+        generic_client_id=None,
+        ui_access_mode=ui_access_mode,
+        access_token_payload=None,
         jwt_handler=jwt_handler,
         return_to=cp_return_to,
     )
