@@ -155,6 +155,91 @@ def test_noop_when_field_absent(_registry):
     validate_logging_exporter_assignment(None, _non_admin())
 
 
+# --- Veria F4: removal-via-omission ----------------------------------------
+#
+# Update endpoints replace stored metadata wholesale. A caller can wipe an
+# admin-assigned `logging_exporters` by sending a `metadata` payload that
+# omits the field. The validator must catch this when ``existing_metadata``
+# is passed.
+
+
+def test_removal_via_omission_blocked_for_non_admin(_registry):
+    """A non-admin with no flags cannot wipe an admin-assigned exporter by
+    submitting metadata without logging_exporters."""
+    with pytest.raises(HTTPException) as exc:
+        validate_logging_exporter_assignment(
+            {"some_other_key": 1},  # no logging_exporters in the new payload
+            _non_admin(),
+            existing_metadata={"logging_exporters": ["langfuse-eu"]},
+        )
+    assert exc.value.status_code == 403
+
+
+def test_removal_via_omission_allowed_for_proxy_admin(_registry):
+    """Proxy admin may drop the exporter via omission."""
+    validate_logging_exporter_assignment(
+        {"some_other_key": 1},
+        _admin(),
+        existing_metadata={"logging_exporters": ["langfuse-eu"]},
+    )
+
+
+def test_removal_via_omission_allowed_for_team_admin(_registry):
+    """A team-admin of the owning team may drop the exporter."""
+    validate_logging_exporter_assignment(
+        {"some_other_key": 1},
+        _non_admin(),
+        caller_is_team_admin=True,
+        existing_metadata={"logging_exporters": ["langfuse-eu"]},
+    )
+
+
+def test_explicit_empty_list_blocked_for_non_admin(_registry):
+    """A non-admin submitting `logging_exporters: []` over a non-empty stored
+    value is a removal write and must be gated."""
+    with pytest.raises(HTTPException) as exc:
+        validate_logging_exporter_assignment(
+            {"logging_exporters": []},
+            _non_admin(),
+            existing_metadata={"logging_exporters": ["langfuse-eu"]},
+        )
+    assert exc.value.status_code == 403
+
+
+def test_explicit_null_blocked_for_non_admin(_registry):
+    """`logging_exporters: null` over a non-empty stored value is also a
+    removal; the validator's shape check would reject it as non-list, but
+    F4's authorization gate must fire first."""
+    with pytest.raises(HTTPException) as exc:
+        validate_logging_exporter_assignment(
+            {"logging_exporters": None},
+            _non_admin(),
+            existing_metadata={"logging_exporters": ["langfuse-eu"]},
+        )
+    assert exc.value.status_code == 403
+
+
+def test_unchanged_value_is_noop(_registry):
+    """A metadata payload that re-sends the SAME logging_exporters value is
+    a noop and skips the gate even for a non-admin -- there is no net change
+    to authorize."""
+    validate_logging_exporter_assignment(
+        {"logging_exporters": ["langfuse-eu"]},
+        _non_admin(),
+        existing_metadata={"logging_exporters": ["langfuse-eu"]},
+    )
+
+
+def test_omitted_on_both_sides_is_noop(_registry):
+    """A metadata update that doesn't touch logging_exporters on a row that
+    never had one is a noop."""
+    validate_logging_exporter_assignment(
+        {"some_other_key": 1},
+        _non_admin(),
+        existing_metadata={"some_other_key": 0},
+    )
+
+
 # --- is_admin_gated_credential_info / validate_credential_access ------------
 
 

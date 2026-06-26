@@ -2577,7 +2577,6 @@ async def update_key_fn(
         _is_user_team_admin,
     )
     from litellm.proxy.management_endpoints.logging_exporter_validation import (
-        LOGGING_EXPORTERS_KEY,
         validate_logging_exporter_assignment,
     )
     from litellm.proxy.proxy_server import (
@@ -2612,8 +2611,14 @@ async def update_key_fn(
 
         # logging-exporters validation runs once the key's team is known so
         # a team-admin or org-admin of that team can attach destinations.
-        # Skip the team lookup entirely when the field isn't being written.
-        if isinstance(data.metadata, dict) and LOGGING_EXPORTERS_KEY in data.metadata:
+        # The validator no-ops when the effective value doesn't change; pass
+        # the stored metadata so removal-via-omission gates too (Veria F4).
+        if isinstance(data.metadata, dict):
+            _existing_key_metadata = (
+                existing_key_row.metadata
+                if isinstance(getattr(existing_key_row, "metadata", None), dict)
+                else None
+            )
             _key_team_id = getattr(existing_key_row, "team_id", None)
             _key_team = None
             if _key_team_id is not None:
@@ -2642,6 +2647,7 @@ async def update_key_fn(
                         user_api_key_dict=user_api_key_dict, team_obj=_key_team
                     )
                 ),
+                existing_metadata=_existing_key_metadata,
             )
 
         await _validate_update_key_data(
@@ -4813,37 +4819,42 @@ async def regenerate_key_fn(
         # /key/update. Without this, a key owner could set
         # metadata.logging_exporters on /key/{id}/regenerate and route
         # future traces to a destination they aren't allowed to assign
-        # (Veria F3). Skip the role lookup unless the field is being
-        # written.
+        # (Veria F3). The validator no-ops when the effective value
+        # doesn't change; pass stored metadata so removal-via-omission
+        # gates too (Veria F4).
         if data is not None and isinstance(data.metadata, dict):
             from litellm.proxy.management_endpoints.common_utils import (
                 _is_user_org_admin_for_team,
                 _is_user_team_admin,
             )
             from litellm.proxy.management_endpoints.logging_exporter_validation import (
-                LOGGING_EXPORTERS_KEY,
                 validate_logging_exporter_assignment,
             )
 
-            if LOGGING_EXPORTERS_KEY in data.metadata:
-                validate_logging_exporter_assignment(
-                    data.metadata,
-                    user_api_key_dict,
-                    caller_is_team_admin=(
-                        regenerate_team_table is not None
-                        and _is_user_team_admin(
-                            user_api_key_dict=user_api_key_dict,
-                            team_obj=regenerate_team_table,
-                        )
-                    ),
-                    caller_is_org_admin=(
-                        regenerate_team_table is not None
-                        and await _is_user_org_admin_for_team(
-                            user_api_key_dict=user_api_key_dict,
-                            team_obj=regenerate_team_table,
-                        )
-                    ),
-                )
+            _regen_existing_metadata = (
+                _key_in_db.metadata
+                if isinstance(getattr(_key_in_db, "metadata", None), dict)
+                else None
+            )
+            validate_logging_exporter_assignment(
+                data.metadata,
+                user_api_key_dict,
+                caller_is_team_admin=(
+                    regenerate_team_table is not None
+                    and _is_user_team_admin(
+                        user_api_key_dict=user_api_key_dict,
+                        team_obj=regenerate_team_table,
+                    )
+                ),
+                caller_is_org_admin=(
+                    regenerate_team_table is not None
+                    and await _is_user_org_admin_for_team(
+                        user_api_key_dict=user_api_key_dict,
+                        team_obj=regenerate_team_table,
+                    )
+                ),
+                existing_metadata=_regen_existing_metadata,
+            )
 
         verbose_proxy_logger.info(
             "Key regeneration requested: key_alias=%s",

@@ -91,25 +91,68 @@ def _validate_exporters_shape_and_names(exporters: object) -> None:
         )
 
 
+def _exporter_value_changes(
+    requested_metadata: Optional[dict],
+    existing_metadata: Optional[dict],
+) -> bool:
+    """True if the effective ``metadata.logging_exporters`` value would change.
+
+    An update endpoint that REPLACES stored metadata with ``requested_metadata``
+    will drop ``logging_exporters`` when the new payload omits it. So a write
+    requires authorization whenever:
+
+    - the new metadata sets ``logging_exporters`` (the previously-handled case), OR
+    - the new metadata is provided but omits ``logging_exporters`` while the
+      stored metadata had one (removal-via-omission, Veria F4).
+
+    Returns False when stored and requested values match exactly, or when the
+    update doesn't touch metadata at all.
+    """
+    if not isinstance(requested_metadata, dict):
+        return False
+    new_has = LOGGING_EXPORTERS_KEY in requested_metadata
+    existing = (
+        existing_metadata.get(LOGGING_EXPORTERS_KEY)
+        if isinstance(existing_metadata, dict)
+        else None
+    )
+    existing_has = existing is not None
+    if not new_has and not existing_has:
+        return False
+    if new_has and not existing_has:
+        return True
+    if not new_has and existing_has:
+        return True
+    return requested_metadata.get(LOGGING_EXPORTERS_KEY) != existing
+
+
 def validate_logging_exporter_assignment(
     metadata: Optional[dict],
     user_api_key_dict: UserAPIKeyAuth,
     *,
     caller_is_team_admin: bool = False,
     caller_is_org_admin: bool = False,
+    existing_metadata: Optional[dict] = None,
 ) -> None:
     """Validate a ``metadata.logging_exporters`` write on key / team / org endpoints.
 
-    No-op when the update does not touch ``logging_exporters``. Proxy admins always
-    pass. Caller-provided flags widen the allow-list per endpoint:
+    No-op when the update does not change the effective ``logging_exporters``
+    value. Proxy admins always pass. Caller-provided flags widen the allow-list
+    per endpoint:
 
     - ``/team/update``: pass ``caller_is_org_admin`` from the loaded team's org.
     - ``/key/generate``/``/key/update``: pass both flags from the key's team.
     - ``/team/new``/``/organization/*``: pass neither (proxy-admin only).
 
-    Every exporter name must resolve to a registered logging credential.
+    Update paths replace stored metadata wholesale, so a caller can drop an
+    admin-assigned exporter by sending ``metadata`` without
+    ``logging_exporters``. Pass ``existing_metadata`` from the loaded row so
+    removal-via-omission is gated too (Veria F4). On create paths the existing
+    value is implicitly ``None`` and the validator behaves as before.
+
+    Every exporter name (when present) must resolve to a registered logging credential.
     """
-    if not isinstance(metadata, dict) or LOGGING_EXPORTERS_KEY not in metadata:
+    if not _exporter_value_changes(metadata, existing_metadata):
         return
     is_proxy_admin = user_api_key_dict.user_role == LitellmUserRoles.PROXY_ADMIN
     if not (is_proxy_admin or caller_is_team_admin or caller_is_org_admin):
@@ -123,4 +166,8 @@ def validate_logging_exporter_assignment(
                 )
             },
         )
-    _validate_exporters_shape_and_names(metadata.get(LOGGING_EXPORTERS_KEY))
+    requested = (
+        metadata.get(LOGGING_EXPORTERS_KEY) if isinstance(metadata, dict) else None
+    )
+    if requested is not None:
+        _validate_exporters_shape_and_names(requested)

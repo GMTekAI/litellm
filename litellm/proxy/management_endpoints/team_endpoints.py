@@ -1736,7 +1736,6 @@ async def update_team(
             _is_user_org_admin_for_team,
         )
         from litellm.proxy.management_endpoints.logging_exporter_validation import (
-            LOGGING_EXPORTERS_KEY,
             validate_logging_exporter_assignment,
         )
         from litellm.proxy.proxy_server import (
@@ -1809,15 +1808,22 @@ async def update_team(
         # team-admins are blocked at the route gate (test_team_update_authz_
         # matrix pins this) and the role matrix documents ❌ for team-admin on
         # this path. Pass only the org-admin flag so the validator can't
-        # silently grant team-admins if the route gate is ever widened. Skip
-        # the lookup entirely when the field isn't in the payload.
-        if isinstance(data.metadata, dict) and LOGGING_EXPORTERS_KEY in data.metadata:
+        # silently grant team-admins if the route gate is ever widened. The
+        # validator no-ops when the effective value doesn't change; pass the
+        # stored metadata so removal-via-omission gates too (Veria F4).
+        if isinstance(data.metadata, dict):
+            existing_team_metadata = (
+                existing_team_row.metadata
+                if isinstance(existing_team_row.metadata, dict)
+                else None
+            )
             validate_logging_exporter_assignment(
                 data.metadata,
                 user_api_key_dict,
                 caller_is_org_admin=await _is_user_org_admin_for_team(
                     user_api_key_dict=user_api_key_dict, team_obj=team_for_auth
                 ),
+                existing_metadata=existing_team_metadata,
             )
 
         _check_passthrough_routes_caller_permission(
