@@ -625,6 +625,44 @@ def test_close_without_carrier_drops_when_payload_missing(monkeypatch):
     assert exporter.get_finished_spans() == ()
 
 
+def test_close_dedupes_duplicate_callbacks(monkeypatch):
+    """Cursor BugBot regression: a normal close pops the carrier and emits
+    the LLM span; a second callback for the same call_id must not emit a
+    duplicate. Before the dedup guard, the second close hit the
+    carrier-is-None branch and fired _emit_deferred_llm_call again whenever
+    payload + destinations remained on the kwargs, double-exporting the
+    span (e.g. success + failure callbacks both firing, or a custom callback
+    fanning out)."""
+    logger, exporter = _logger()
+    monkeypatch.setattr(logger, "callback_name", "in_memory")
+    server = logger._emitter.start_span(
+        SpanRole.PROXY_REQUEST, LITELLM_PROXY_REQUEST_SPAN_NAME
+    )
+    set_request_root_span(server)
+    monkeypatch.setattr(
+        logger._tenant_tracers, "tracer_for", lambda default, dests: default
+    )
+    kwargs = _kwargs()
+    kwargs["standard_callback_dynamic_params"] = {
+        "otel_destinations": [
+            {
+                "callback_name": "in_memory",
+                "endpoint": "https://otlp.example.com/v1",
+                "headers": {},
+            }
+        ]
+    }
+    logger.log_pre_api_call(model="gpt-4o", messages=[], kwargs=kwargs)
+    asyncio.run(logger.async_log_success_event(kwargs, None, None, None))
+    # Second callback for the same call_id: payload + destinations still on
+    # kwargs, but no second span must emit.
+    asyncio.run(logger.async_log_success_event(kwargs, None, None, None))
+    asyncio.run(logger.async_log_failure_event(kwargs, None, None, None))
+    server.end()
+    llm_spans = [s for s in exporter.get_finished_spans() if s.name == "chat gpt-4o"]
+    assert len(llm_spans) == 1
+
+
 def test_create_request_started_span_captures_anchor():
     """``create_litellm_proxy_request_started_span`` doubles as the anchor capture
     point: the active server span becomes the request root for later spans."""

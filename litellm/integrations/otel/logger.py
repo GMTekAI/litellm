@@ -124,6 +124,11 @@ class OpenTelemetryV2(CustomLogger):
             self.config, callback_name, LITELLM_TRACER_NAME
         )
         self._open_llm_calls: "OrderedDict[str, _LLMCallSpan]" = OrderedDict()
+        # call_ids for which the LLM-call span has already been emitted; lets
+        # _close_llm_call no-op on duplicate callbacks (success + failure both
+        # firing, or success firing twice) instead of double-exporting the
+        # deferred-emit span. Bounded LRU, same size as _open_llm_calls.
+        self._closed_call_ids: "OrderedDict[str, None]" = OrderedDict()
         self._init_otel_logger_on_litellm_proxy()
 
     def _init_metrics(self, meter_provider: Any | None) -> "GenAIMetricRecorder | None":
@@ -326,6 +331,15 @@ class OpenTelemetryV2(CustomLogger):
         """
         call = LLMCallEvent.from_dict(kwargs)
         call_id = call.call_id
+
+        # Dedup guard: a normal close pops the carrier and emits a span. If a
+        # second close fires for the same call_id (success + failure callbacks
+        # are wired separately, custom callbacks can fan out, etc.), the
+        # carrier is already gone and a payload+destinations combination would
+        # otherwise emit a second deferred span.
+        if call_id and call_id in self._closed_call_ids:
+            return None
+
         carrier = self._open_llm_calls.pop(call_id, None) if call_id else None
         payload = call.payload
 
@@ -333,11 +347,13 @@ class OpenTelemetryV2(CustomLogger):
             destinations = self._destinations_for_backend(call)
             if payload is None or not destinations:
                 return None
+            self._mark_closed(call_id)
             return self._emit_deferred_llm_call(
                 payload, destinations, to_ns(start_time), to_ns(end_time)
             )
 
         end_time_ns = to_ns(end_time)
+        self._mark_closed(call_id)
         if payload is None:
             if carrier.span is not None:
                 carrier.span.end(end_time=end_time_ns)
@@ -357,6 +373,18 @@ class OpenTelemetryV2(CustomLogger):
             carrier.start_time_ns,
             end_time_ns,
         )
+
+    def _mark_closed(self, call_id: str | None) -> None:
+        """Remember a call_id has been closed so a duplicate callback no-ops.
+
+        Bounded by the same ceiling as ``_open_llm_calls`` to prevent unbounded
+        growth; oldest entries are evicted FIFO.
+        """
+        if not call_id:
+            return
+        self._closed_call_ids[call_id] = None
+        if len(self._closed_call_ids) > _OPEN_CALLS_MAX:
+            self._closed_call_ids.popitem(last=False)
 
     def _emit_deferred_llm_call(
         self,
