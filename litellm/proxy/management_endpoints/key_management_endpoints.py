@@ -574,6 +574,7 @@ def _check_budget_limits_delegation_ceiling(
     delegation_ceiling: Optional[float],
     user_api_key_dict: UserAPIKeyAuth,
     is_ui_session_team_key: bool,
+    team_table: Optional[LiteLLM_TeamTableCachedObj],
 ) -> None:
     """
     Enforce the delegation ceiling on every per-window budget entry.
@@ -581,7 +582,10 @@ def _check_budget_limits_delegation_ceiling(
     The single-value `max_budget` check upstream guards the all-time budget;
     `budget_limits` lets a key carry independent concurrent windows and was
     bypassing the ceiling entirely, so a non-admin caller could mint a key
-    with a window budget far above their own authority.
+    with a window budget far above their own authority. The session-token +
+    personal-key carve-out mirrors the scalar guard: a CLI session token
+    carries `max_budget=None` deliberately, so reading it as unlimited
+    delegation authority for a personal key inverts the intent.
     """
     if not budget_limits:
         return
@@ -589,6 +593,29 @@ def _check_budget_limits_delegation_ceiling(
         return
     if is_ui_session_team_key:
         return
+    over_ceiling = next(
+        (w for w in budget_limits if not math.isfinite(w.max_budget)), None
+    )
+    if over_ceiling is not None:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error": (
+                    f"budget_limits entry max_budget ({over_ceiling.max_budget}) "
+                    "must be a finite number."
+                )
+            },
+        )
+    if user_api_key_dict.is_session_token and team_table is None:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error": (
+                    "budget_limits cannot be set without specifying team_id when "
+                    "using a CLI session token."
+                )
+            },
+        )
     if delegation_ceiling is None:
         return
     over_ceiling = next(
@@ -808,6 +835,7 @@ async def _common_key_generation_helper(
         delegation_ceiling=delegation_ceiling,
         user_api_key_dict=user_api_key_dict,
         is_ui_session_team_key=is_ui_session_team_key,
+        team_table=team_table,
     )
     _check_permissions_caller_permission(
         permissions=data.permissions,
@@ -1422,7 +1450,7 @@ async def generate_key_fn(
     - guardrails: Optional[List[str]] - List of active guardrails for the key
     - policies: Optional[List[str]] - List of policy names to apply to the key. Policies define guardrails, conditions, and inheritance rules.
     - disable_global_guardrails: Optional[bool] - Whether to disable global guardrails for the key.
-    - permissions: Optional[dict] - key-specific permissions. Currently just used for turning off pii masking (if connected). Example - {"pii": false}
+    - permissions: Optional[dict] - key-specific permissions. Proxy-admin-only field; non-admin callers must leave this empty. Example - {"allow_pii_controls": true}
     - model_max_budget: Optional[Dict[str, BudgetConfig]] - Model-specific budgets {"gpt-4": {"budget_limit": 0.0005, "time_period": "30d"}}}. IF null or {} then no model specific budget.
     - model_rpm_limit: Optional[dict] - key-specific model rpm limit. Example - {"text-davinci-002": 1000, "gpt-3.5-turbo": 1000}. IF null or {} then no model specific rpm limit.
     - model_tpm_limit: Optional[dict] - key-specific model tpm limit. Example - {"text-davinci-002": 1000, "gpt-3.5-turbo": 1000}. IF null or {} then no model specific tpm limit.
@@ -1627,7 +1655,7 @@ async def generate_service_account_key_fn(
     - max_parallel_requests: Optional[int] - Rate limit a user based on the number of parallel requests. Raises 429 error, if user's parallel requests > x.
     - metadata: Optional[dict] - Metadata for key, store information for key. Example metadata = {"team": "core-infra", "app": "app2", "email": "ishaan@berri.ai" }
     - guardrails: Optional[List[str]] - List of active guardrails for the key
-    - permissions: Optional[dict] - key-specific permissions. Currently just used for turning off pii masking (if connected). Example - {"pii": false}
+    - permissions: Optional[dict] - key-specific permissions. Proxy-admin-only field; non-admin callers must leave this empty. Example - {"allow_pii_controls": true}
     - model_max_budget: Optional[Dict[str, BudgetConfig]] - Model-specific budgets {"gpt-4": {"budget_limit": 0.0005, "time_period": "30d"}}}. IF null or {} then no model specific budget.
     - model_rpm_limit: Optional[dict] - key-specific model rpm limit. Example - {"text-davinci-002": 1000, "gpt-3.5-turbo": 1000}. IF null or {} then no model specific rpm limit.
     - model_tpm_limit: Optional[dict] - key-specific model tpm limit. Example - {"text-davinci-002": 1000, "gpt-3.5-turbo": 1000}. IF null or {} then no model specific tpm limit.
@@ -2182,6 +2210,10 @@ async def _validate_update_key_data(
         data=data,
         user_api_key_dict=user_api_key_dict,
     )
+    _check_permissions_caller_permission(
+        permissions=data.permissions,
+        user_api_key_dict=user_api_key_dict,
+    )
 
     _validate_caller_can_change_key_ownership(
         data=data,
@@ -2428,7 +2460,7 @@ async def update_key_fn(
     - rpm_limit_type: Optional[str] - RPM rate limit type - "best_effort_throughput", "guaranteed_throughput", or "dynamic"
     - allowed_cache_controls: Optional[list] - List of allowed cache control values
     - duration: Optional[str] - Key validity duration ("30d", "1h", etc.), null to never expire, or "-1" to never expire (deprecated, use null)
-    - permissions: Optional[dict] - Key-specific permissions
+    - permissions: Optional[dict] - Key-specific permissions. Proxy-admin-only field; non-admin callers must leave this empty
     - send_invite_email: Optional[bool] - Send invite email to user_id
     - guardrails: Optional[List[str]] - List of active guardrails for the key
     - policies: Optional[List[str]] - List of policy names to apply to the key. Policies define guardrails, conditions, and inheritance rules.
@@ -4378,7 +4410,7 @@ async def regenerate_key_fn(
         - model_tpm_limit: Optional[dict] - Model-specific TPM limits {"gpt-4": 100000, "claude-v1": 200000}
         - allowed_cache_controls: Optional[list] - List of allowed cache control values
         - duration: Optional[str] - Key validity duration ("30d", "1h", etc.)
-        - permissions: Optional[dict] - Key-specific permissions
+        - permissions: Optional[dict] - Key-specific permissions. Proxy-admin-only field; non-admin callers must leave this empty
         - guardrails: Optional[List[str]] - List of active guardrails for the key
         - blocked: Optional[bool] - Whether the key is blocked
         - grace_period: Optional[str] - Duration to keep old key valid after rotation (e.g. "24h", "2d"). Omitted = immediate revoke. Env: LITELLM_KEY_ROTATION_GRACE_PERIOD
@@ -4419,6 +4451,17 @@ async def regenerate_key_fn(
             _check_passthrough_routes_caller_permission(
                 data=data,
                 user_api_key_dict=user_api_key_dict,
+            )
+            _check_permissions_caller_permission(
+                permissions=data.permissions,
+                user_api_key_dict=user_api_key_dict,
+            )
+            _check_budget_limits_delegation_ceiling(
+                budget_limits=data.budget_limits,
+                delegation_ceiling=user_api_key_dict.max_budget,
+                user_api_key_dict=user_api_key_dict,
+                is_ui_session_team_key=False,
+                team_table=None,
             )
             # Mirror /key/generate's post-handle_key_type recheck so a
             # non-admin can't elevate via a key_type preset that the

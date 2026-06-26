@@ -12899,3 +12899,200 @@ async def test_permissions_admin_can_set_any(monkeypatch):
             team_table=None,
         )
     assert result is not None
+
+
+@pytest.mark.asyncio
+async def test_budget_limits_session_token_personal_key_blocked(monkeypatch):
+    """
+    VERIA-392 B1: a CLI session token (max_budget=None) writing
+    budget_limits to a personal key has zero delegation authority. The
+    symmetric guard already exists for the scalar max_budget; budget_limits
+    must follow the same rule, before any delegation_ceiling early-return.
+    """
+    monkeypatch.setattr(
+        "litellm.proxy.management_endpoints.key_management_endpoints.litellm.default_key_generate_params",
+        None,
+        raising=False,
+    )
+    caller = UserAPIKeyAuth(
+        user_role=LitellmUserRoles.INTERNAL_USER,
+        user_id="user-1",
+        is_session_token=True,
+    )
+    request = GenerateKeyRequest(
+        budget_limits=[{"budget_duration": "1d", "max_budget": 1_000_000.0}],
+    )
+    with pytest.raises(HTTPException) as exc_info:
+        await _common_key_generation_helper(
+            data=request,
+            user_api_key_dict=caller,
+            litellm_changed_by=None,
+            team_table=None,
+        )
+    assert exc_info.value.status_code == 400
+    assert "session token" in str(exc_info.value.detail)
+
+
+@pytest.mark.asyncio
+async def test_budget_limits_window_equal_to_ceiling_allowed(monkeypatch):
+    """
+    VERIA-392 m2 boundary: a window exactly equal to the caller's ceiling
+    is permitted. Pins the strict `>` semantics so a future refactor to `>=`
+    is caught by tests.
+    """
+    monkeypatch.setattr(
+        "litellm.proxy.management_endpoints.key_management_endpoints.litellm.default_key_generate_params",
+        None,
+        raising=False,
+    )
+    caller = UserAPIKeyAuth(
+        user_role=LitellmUserRoles.INTERNAL_USER,
+        user_id="user-1",
+        max_budget=10.0,
+    )
+    request = GenerateKeyRequest(
+        budget_limits=[{"budget_duration": "1d", "max_budget": 10.0}],
+    )
+    with patch(
+        "litellm.proxy.management_endpoints.key_management_endpoints.generate_key_helper_fn",
+        new_callable=AsyncMock,
+        return_value={"key": "sk-test", "expires": None, "user_id": "user-1"},
+    ):
+        result = await _common_key_generation_helper(
+            data=request,
+            user_api_key_dict=caller,
+            litellm_changed_by=None,
+            team_table=None,
+        )
+    assert result is not None
+
+
+@pytest.mark.asyncio
+async def test_budget_limits_nan_window_rejected(monkeypatch):
+    """
+    VERIA-392 M1: a NaN window max_budget bypasses the `>` ceiling check
+    (NaN > x is False) and disables downstream budget enforcement
+    (spend > NaN is always False). math.isfinite must reject it before the
+    ceiling comparison runs.
+    """
+    monkeypatch.setattr(
+        "litellm.proxy.management_endpoints.key_management_endpoints.litellm.default_key_generate_params",
+        None,
+        raising=False,
+    )
+    caller = UserAPIKeyAuth(
+        user_role=LitellmUserRoles.INTERNAL_USER,
+        user_id="user-1",
+        max_budget=10.0,
+    )
+    request = GenerateKeyRequest(
+        budget_limits=[{"budget_duration": "1d", "max_budget": float("nan")}],
+    )
+    with pytest.raises(HTTPException) as exc_info:
+        await _common_key_generation_helper(
+            data=request,
+            user_api_key_dict=caller,
+            litellm_changed_by=None,
+            team_table=None,
+        )
+    assert exc_info.value.status_code == 400
+    assert "finite" in str(exc_info.value.detail)
+
+
+@pytest.mark.asyncio
+async def test_update_key_non_admin_permissions_rejected(monkeypatch):
+    """
+    VERIA-392 B2: /key/update did not gate the permissions dict. A non-admin
+    key owner could silently flip allow_pii_controls / custom_admin / etc.
+    on their own key because permissions is not a budget field, so the
+    can_skip_admin_check fast path applied. Now mirrors /key/generate.
+    """
+    from litellm.proxy._types import LiteLLM_VerificationToken
+    from litellm.proxy.management_endpoints.key_management_endpoints import (
+        _validate_update_key_data,
+    )
+    monkeypatch.setattr(
+        "litellm.proxy.management_endpoints.key_management_endpoints.litellm.default_key_generate_params",
+        None,
+        raising=False,
+    )
+    owner = UserAPIKeyAuth(
+        user_role=LitellmUserRoles.INTERNAL_USER,
+        user_id="alice",
+        max_budget=10.0,
+    )
+    existing_key = LiteLLM_VerificationToken(
+        token="hashed-key",
+        user_id="alice",
+        created_by="alice",
+        max_budget=10.0,
+        spend=0.0,
+    )
+    data = UpdateKeyRequest(
+        key="sk-alice", permissions={"allow_pii_controls": True}
+    )
+    with pytest.raises(HTTPException) as exc_info:
+        await _validate_update_key_data(
+            data=data,
+            existing_key_row=existing_key,
+            user_api_key_dict=owner,
+            llm_router=None,
+            premium_user=False,
+            prisma_client=None,
+            user_api_key_cache=None,
+        )
+    assert exc_info.value.status_code == 403
+    assert "permissions" in str(exc_info.value.detail)
+
+
+@pytest.mark.asyncio
+async def test_regenerate_key_non_admin_permissions_rejected():
+    """
+    VERIA-392 B2: /key/regenerate inherited the same hole as /key/generate
+    and /key/update. The handler now invokes _check_permissions_caller_permission
+    on the request body before any DB lookup.
+    """
+    from litellm.proxy.management_endpoints.key_management_endpoints import (
+        _check_permissions_caller_permission,
+    )
+    owner = UserAPIKeyAuth(
+        user_role=LitellmUserRoles.INTERNAL_USER,
+        user_id="alice",
+        max_budget=10.0,
+    )
+    with pytest.raises(HTTPException) as exc_info:
+        _check_permissions_caller_permission(
+            permissions={"allow_pii_controls": True},
+            user_api_key_dict=owner,
+        )
+    assert exc_info.value.status_code == 403
+
+
+@pytest.mark.asyncio
+async def test_regenerate_key_non_admin_budget_limits_rejected():
+    """
+    VERIA-392 B2: /key/regenerate's body carries budget_limits. The
+    handler now applies _check_budget_limits_delegation_ceiling so a
+    non-admin owner of a $10 key cannot regenerate it into a $1M/day key.
+    """
+    from litellm.proxy.management_endpoints.key_management_endpoints import (
+        _check_budget_limits_delegation_ceiling,
+    )
+    from litellm.models.team import BudgetLimitEntry
+    owner = UserAPIKeyAuth(
+        user_role=LitellmUserRoles.INTERNAL_USER,
+        user_id="alice",
+        max_budget=10.0,
+    )
+    with pytest.raises(HTTPException) as exc_info:
+        _check_budget_limits_delegation_ceiling(
+            budget_limits=[
+                BudgetLimitEntry(budget_duration="1d", max_budget=1_000_000.0)
+            ],
+            delegation_ceiling=owner.max_budget,
+            user_api_key_dict=owner,
+            is_ui_session_team_key=False,
+            team_table=None,
+        )
+    assert exc_info.value.status_code == 400
+    assert "budget_limits" in str(exc_info.value.detail)
