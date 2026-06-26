@@ -55,6 +55,7 @@ _SAML_AUTHN_REQUEST_CACHE_PREFIX = "saml_authn_request"
 _SAML_CONSUMED_ASSERTION_CACHE_PREFIX = "saml_consumed_assertion"
 _SAML_AUTHN_REQUEST_TTL_SECONDS = 600
 _SAML_IDP_METADATA_TTL_SECONDS = 3600
+_SAML_METADATA_FETCH_TIMEOUT_SECONDS = 10
 # The replay guard tracks each assertion's NotOnOrAfter so it spans the full
 # validity window; the floor covers IdPs that issue hour-long assertions or omit
 # the timestamp, and the cap bounds cache growth.
@@ -163,7 +164,10 @@ class SAMLAuthHandler:
             parsed = await asyncio.to_thread(
                 OneLogin_Saml2_IdPMetadataParser.parse_remote,
                 metadata_url,
-                False,
+                validate_cert=SAMLAuthHandler._bool_env(
+                    "SAML_IDP_METADATA_VALIDATE_CERT", True
+                ),
+                timeout=_SAML_METADATA_FETCH_TIMEOUT_SECONDS,
             )
         else:
             parsed = OneLogin_Saml2_IdPMetadataParser.parse(cast(str, metadata_xml))
