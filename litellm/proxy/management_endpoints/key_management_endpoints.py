@@ -1775,6 +1775,37 @@ async def generate_service_account_key_fn(
         route=KeyManagementRoutes.KEY_GENERATE_SERVICE_ACCOUNT,
     )
 
+    # Same logging_exporters gate as /key/generate. Without this, a caller
+    # eligible for service-account creation could set metadata.logging_exporters
+    # and route future traces to a destination they aren't allowed to assign
+    # (Veria F3). Skip the lookup unless the field is being written.
+    from litellm.proxy.management_endpoints.common_utils import (
+        _is_user_org_admin_for_team,
+        _is_user_team_admin,
+    )
+    from litellm.proxy.management_endpoints.logging_exporter_validation import (
+        LOGGING_EXPORTERS_KEY,
+        validate_logging_exporter_assignment,
+    )
+
+    if isinstance(data.metadata, dict) and LOGGING_EXPORTERS_KEY in data.metadata:
+        validate_logging_exporter_assignment(
+            data.metadata,
+            user_api_key_dict,
+            caller_is_team_admin=(
+                team_table is not None
+                and _is_user_team_admin(
+                    user_api_key_dict=user_api_key_dict, team_obj=team_table
+                )
+            ),
+            caller_is_org_admin=(
+                team_table is not None
+                and await _is_user_org_admin_for_team(
+                    user_api_key_dict=user_api_key_dict, team_obj=team_table
+                )
+            ),
+        )
+
     data.user_id = None  # do not allow user_id to be set for service account keys
 
     return await _common_key_generation_helper(
@@ -4760,20 +4791,59 @@ async def regenerate_key_fn(
 
         # Gate access_group_ids on regenerate, same as /key/generate and
         # /key/update. Use the existing key's team since the body may omit it.
-        if data is not None and data.access_group_ids:
-            regenerate_team_table: Optional[LiteLLM_TeamTableCachedObj] = None
-            if _key_in_db.team_id is not None:
+        regenerate_team_table: Optional[LiteLLM_TeamTableCachedObj] = None
+        if _key_in_db.team_id is not None:
+            try:
                 regenerate_team_table = await get_team_object(
                     team_id=_key_in_db.team_id,
                     prisma_client=prisma_client,
                     user_api_key_cache=user_api_key_cache,
                     check_db_only=True,
                 )
+            except HTTPException:
+                regenerate_team_table = None
+        if data is not None and data.access_group_ids:
             TeamMemberPermissionChecks.enforce_member_can_assign_access_groups(
                 user_api_key_dict=user_api_key_dict,
                 team_table=regenerate_team_table,
                 access_group_ids=data.access_group_ids,
             )
+
+        # logging_exporters gate on regenerate matches /key/generate and
+        # /key/update. Without this, a key owner could set
+        # metadata.logging_exporters on /key/{id}/regenerate and route
+        # future traces to a destination they aren't allowed to assign
+        # (Veria F3). Skip the role lookup unless the field is being
+        # written.
+        if data is not None and isinstance(data.metadata, dict):
+            from litellm.proxy.management_endpoints.common_utils import (
+                _is_user_org_admin_for_team,
+                _is_user_team_admin,
+            )
+            from litellm.proxy.management_endpoints.logging_exporter_validation import (
+                LOGGING_EXPORTERS_KEY,
+                validate_logging_exporter_assignment,
+            )
+
+            if LOGGING_EXPORTERS_KEY in data.metadata:
+                validate_logging_exporter_assignment(
+                    data.metadata,
+                    user_api_key_dict,
+                    caller_is_team_admin=(
+                        regenerate_team_table is not None
+                        and _is_user_team_admin(
+                            user_api_key_dict=user_api_key_dict,
+                            team_obj=regenerate_team_table,
+                        )
+                    ),
+                    caller_is_org_admin=(
+                        regenerate_team_table is not None
+                        and await _is_user_org_admin_for_team(
+                            user_api_key_dict=user_api_key_dict,
+                            team_obj=regenerate_team_table,
+                        )
+                    ),
+                )
 
         verbose_proxy_logger.info(
             "Key regeneration requested: key_alias=%s",
