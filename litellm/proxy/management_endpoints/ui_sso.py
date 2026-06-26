@@ -137,6 +137,8 @@ router = APIRouter()
 # Metadata fields (token_type, expires_in, scope) are intentionally kept so
 # response convertors see the same fields in the PKCE path as in the non-PKCE path.
 _OAUTH_TOKEN_FIELDS = frozenset({"access_token", "id_token", "refresh_token"})
+# Max number of SSO users allowed without a LiteLLM Enterprise license.
+FREE_SSO_USER_LIMIT = 5
 _CLI_SSO_FLOW_CACHE_KEY_PREFIX = f"{CLI_SSO_SESSION_CACHE_KEY_PREFIX}:flow"
 _CLI_SSO_START_RATE_LIMIT_CACHE_KEY_PREFIX = (
     f"{_CLI_SSO_FLOW_CACHE_KEY_PREFIX}:start_rate_limit"
@@ -930,7 +932,7 @@ async def google_login(
             # Check if under 'free SSO user' limit
             if prisma_client is not None:
                 total_users = await UserRepository(prisma_client).table.count()
-                if total_users and total_users > 5:
+                if total_users and total_users > FREE_SSO_USER_LIMIT:
                     raise ProxyException(
                         message="You must be a LiteLLM Enterprise user to use SSO for more than 5 users. If you have a license please set `LITELLM_LICENSE` in your env. If you want to obtain a license meet with us here: https://enterprise.litellm.ai/demo You are seeing this error message because You set one of `MICROSOFT_CLIENT_ID`, `GOOGLE_CLIENT_ID`, or `GENERIC_CLIENT_ID` in your env. Please unset this",
                         type=ProxyErrorTypes.auth_error,
@@ -2382,7 +2384,6 @@ async def _enforce_free_sso_user_limit(
     """
     if premium_user:
         return
-    FREE_SSO_USER_LIMIT = 5
     total_users = await prisma_client.db.litellm_usertable.count()
     threshold = FREE_SSO_USER_LIMIT if block_at_limit else FREE_SSO_USER_LIMIT + 1
     if total_users is not None and total_users >= threshold:
