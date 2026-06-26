@@ -437,7 +437,5 @@ class FactCheckDataSource(DataSource):
         self.api_key = api_key
         self.config = config
 
-    async def search(
-        self, query: str, limit: int = 5
-    ) -> list[DataSourceResult]:  # noqa: ARG002
+    async def search(self, query: str, limit: int = 5) -> list[DataSourceResult]:  # noqa: ARG002
         return []

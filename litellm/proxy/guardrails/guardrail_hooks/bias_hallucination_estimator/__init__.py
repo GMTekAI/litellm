@@ -55,9 +55,7 @@ def initialize_guardrail(
             ),
         ),
     )
-    logging_callback_manager.add_litellm_callback(
-        callback
-    )  # pyright: ignore[reportUnknownMemberType]
+    logging_callback_manager.add_litellm_callback(callback)  # pyright: ignore[reportUnknownMemberType]
     return callback
 
 

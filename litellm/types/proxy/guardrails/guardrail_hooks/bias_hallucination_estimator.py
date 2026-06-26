@@ -92,9 +92,7 @@ class RiskScore(BaseModel):
     recommendation: Literal["pass", "flag", "block"] = Field(default="pass")
 
 
-class BiasHallucinationEstimatorConfigModel(
-    GuardrailConfigModel
-):  # pyright: ignore[reportMissingTypeArgument]
+class BiasHallucinationEstimatorConfigModel(GuardrailConfigModel):  # pyright: ignore[reportMissingTypeArgument]
     """Configuration schema for the native bias and hallucination estimator."""
 
     bias_threshold: float = Field(default=0.5, ge=0.0, le=1.0)

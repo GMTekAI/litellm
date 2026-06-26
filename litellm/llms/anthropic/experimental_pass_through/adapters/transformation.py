@@ -594,9 +594,9 @@ class LiteLLMAnthropicMessagesAdapter:
 
             ## ASSISTANT MESSAGE ##
             assistant_message_str: Optional[str] = None
-            assistant_content_list: List[Dict[str, Any]] = (
-                []
-            )  # For content blocks with cache_control
+            assistant_content_list: List[
+                Dict[str, Any]
+            ] = []  # For content blocks with cache_control
             has_cache_control_in_text = False
             tool_calls: List[ChatCompletionAssistantToolCall] = []
             thinking_blocks: List[
@@ -1024,7 +1024,9 @@ class LiteLLMAnthropicMessagesAdapter:
             if openai_system_content:
                 new_messages.insert(
                     0,
-                    ChatCompletionSystemMessage(role="system", content=openai_system_content),  # type: ignore
+                    ChatCompletionSystemMessage(
+                        role="system", content=openai_system_content
+                    ),  # type: ignore
                 )
 
     def _translate_metadata_to_openai(
@@ -1461,7 +1463,9 @@ class LiteLLMAnthropicMessagesAdapter:
                 "input_tokens": uncached_input_tokens,
                 "output_tokens": usage.completion_tokens or 0,
             }
-            anthropic_usage["iterations"] = list(polyfill_result.iterations_usage) + [message_iteration]  # type: ignore[typeddict-unknown-key]
+            anthropic_usage["iterations"] = list(polyfill_result.iterations_usage) + [
+                message_iteration
+            ]  # type: ignore[typeddict-unknown-key]
 
         translated_obj = AnthropicMessagesResponse(
             id=response.id,
@@ -1685,7 +1689,9 @@ class LiteLLMAnthropicMessagesAdapter:
             else:
                 usage_delta = UsageDelta(input_tokens=0, output_tokens=0)
             message_block = MessageBlockDelta(
-                type="message_delta", delta=delta, usage=usage_delta  # type: ignore
+                type="message_delta",
+                delta=delta,
+                usage=usage_delta,  # type: ignore
             )
             if applied_edits:
                 message_block["context_management"] = ContextManagementResponse(
