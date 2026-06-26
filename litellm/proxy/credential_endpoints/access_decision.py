@@ -13,7 +13,11 @@ endpoint so it can be unit-tested exhaustively without spinning up FastAPI.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Literal, Mapping, cast
+from typing import Literal, Mapping
+
+from litellm.models.credentials import CredentialAccess, CredentialInfo
+
+OPAQUE_DENY_REASON = "Only the proxy admin can manage logging credentials"
 
 
 @dataclass(frozen=True, slots=True)
@@ -24,6 +28,12 @@ class Allow:
 @dataclass(frozen=True, slots=True)
 class Deny:
     reason: str
+    # When True the reason is derived from caller input (e.g. they typed a
+    # foreign team_id) and is safe to surface. When False the reason would
+    # confirm the stored credential is a logging destination; the endpoint
+    # collapses these to OPAQUE_DENY_REASON so PATCH /credentials/{name}
+    # can't be used as an existence oracle by a non-admin caller.
+    from_user_input: bool = False
     tag: Literal["deny"] = "deny"
 
 
@@ -35,32 +45,25 @@ _IMMUTABLE_INFO_FIELDS = frozenset(
 )
 
 
-_EMPTY: Mapping[str, object] = {}
-
-
-def _access(info: Mapping[str, object] | None) -> Mapping[str, object]:
-    if not isinstance(info, Mapping):
-        return _EMPTY
-    raw = info.get("access")
-    if isinstance(raw, Mapping):
-        return cast(Mapping[str, object], raw)
-    return _EMPTY
-
-
-def _teams_set(access: Mapping[str, object]) -> frozenset[str]:
-    raw = access.get("teams")
-    if not isinstance(raw, (list, tuple)):
+def _patched_fields(info: CredentialInfo | None) -> frozenset[str]:
+    """Names of credential_info fields the caller actually set in their patch."""
+    if info is None:
         return frozenset()
-    teams: tuple[object, ...] = tuple(cast(tuple[object, ...], raw))
-    return frozenset(item for item in teams if isinstance(item, str))
+    return frozenset(info.model_fields_set) | frozenset(
+        info.model_extra.keys() if info.model_extra else ()
+    )
+
+
+def _access_teams(access: CredentialAccess | None) -> frozenset[str]:
+    return frozenset(access.teams) if access is not None else frozenset()
 
 
 def decide_credential_patch(
     *,
     is_proxy_admin: bool,
     caller_team_admin_ids: frozenset[str],
-    existing_info: Mapping[str, object] | None,
-    patch_info: Mapping[str, object] | None,
+    existing_info: CredentialInfo | None,
+    patch_info: CredentialInfo | None,
     patch_values: Mapping[str, object] | None,
     patch_name_changed: bool,
 ) -> Decision:
@@ -77,7 +80,7 @@ def decide_credential_patch(
         return Allow()
 
     if not caller_team_admin_ids:
-        return Deny("Only the proxy admin can manage logging credentials")
+        return Deny(OPAQUE_DENY_REASON)
 
     if patch_name_changed:
         return Deny("credential_name is proxy-admin only")
@@ -85,53 +88,50 @@ def decide_credential_patch(
     if patch_values:
         return Deny("credential_values is proxy-admin only")
 
-    if not isinstance(patch_info, Mapping):
-        # Nothing to do, but a team-admin should only call PATCH to change
-        # access. An empty/None info is a no-op and we refuse it loudly so
-        # the caller corrects the request shape.
+    touched = _patched_fields(patch_info)
+    if not touched:
         return Deny("patch must set credential_info.access for team-admin writes")
 
-    touched_fields = frozenset(patch_info.keys())
-    forbidden = touched_fields & _IMMUTABLE_INFO_FIELDS
+    forbidden = touched & _IMMUTABLE_INFO_FIELDS
     if forbidden:
         return Deny(
             "credential_info fields are proxy-admin only: "
             + ", ".join(sorted(forbidden))
         )
 
-    if touched_fields - {"access"}:
+    if touched - {"access"}:
         return Deny(
             "team-admin may only patch credential_info.access; got: "
-            + ", ".join(sorted(touched_fields))
+            + ", ".join(sorted(touched))
         )
 
-    patch_access = _access(patch_info)
-    if not patch_access:
+    assert patch_info is not None
+    patch_access = patch_info.access
+    if patch_access is None:
         return Deny("credential_info.access must be set for team-admin writes")
 
-    if "global" in patch_access:
+    access_touched = frozenset(patch_access.model_fields_set)
+    if "global_" in access_touched:
         return Deny("access.global is proxy-admin only")
-    if "orgs" in patch_access:
+    if "orgs" in access_touched:
         return Deny("access.orgs is proxy-admin only")
 
-    existing_access = _access(existing_info)
-    existing_teams = _teams_set(existing_access)
-    patch_teams = _teams_set(patch_access)
+    existing_access = existing_info.access if existing_info is not None else None
+    existing_teams = _access_teams(existing_access)
+    patch_teams = _access_teams(patch_access)
 
-    removed = existing_teams - patch_teams
-    foreign_removed = removed - caller_team_admin_ids
+    foreign_removed = (existing_teams - patch_teams) - caller_team_admin_ids
     if foreign_removed:
-        return Deny(
-            "team-admin may only revoke their own team grants; foreign team_ids: "
-            + ", ".join(sorted(foreign_removed))
-        )
+        # Do NOT echo the foreign team_ids -- they're stored values the
+        # caller didn't send, so naming them would leak access list members.
+        return Deny("team-admin may only revoke their own team grants")
 
-    added = patch_teams - existing_teams
-    foreign_added = added - caller_team_admin_ids
+    foreign_added = (patch_teams - existing_teams) - caller_team_admin_ids
     if foreign_added:
         return Deny(
             "team-admin may only grant their own team_ids: "
-            + ", ".join(sorted(foreign_added))
+            + ", ".join(sorted(foreign_added)),
+            from_user_input=True,
         )
 
     return Allow()

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import pytest
 
+from litellm.models.credentials import CredentialInfo
 from litellm.proxy.credential_endpoints.access_decision import (
     Allow,
     Deny,
@@ -23,6 +24,10 @@ _EXISTING_INFO = {
 }
 
 
+def _info(value):
+    return None if value is None else CredentialInfo.model_validate(value)
+
+
 def _decision(
     *,
     is_proxy_admin: bool = False,
@@ -35,8 +40,8 @@ def _decision(
     return decide_credential_patch(
         is_proxy_admin=is_proxy_admin,
         caller_team_admin_ids=caller_team_admin_ids,
-        existing_info=existing_info,
-        patch_info=patch_info,
+        existing_info=_info(existing_info),
+        patch_info=_info(patch_info),
         patch_values=patch_values,
         patch_name_changed=patch_name_changed,
     )
@@ -142,31 +147,43 @@ class TestTeamAdminDeny:
         assert "orgs" in d.reason
 
     def test_adding_foreign_team_id(self):
+        """foreign team_ids in the patch ARE caller input -- safe to echo."""
         d = _decision(
             patch_info={
                 "access": {"teams": ["team-A", "team-B", "team-foreign"]},
             },
         )
         assert isinstance(d, Deny)
+        assert d.from_user_input is True
         assert "team-foreign" in d.reason
 
     def test_removing_foreign_team_grant(self):
-        """team-admin may NOT remove a team they don't admin."""
+        """team-admin may NOT remove a team they don't admin.
+
+        Reason intentionally does NOT echo the stored team_id (it's not
+        caller-typed; surfacing it would leak access list membership).
+        """
         d = _decision(
             patch_info={
                 "access": {"teams": ["team-A", "team-T"]},
             },
         )
         assert isinstance(d, Deny)
-        # team-B was removed and the caller doesn't admin team-B.
-        assert "team-B" in d.reason
+        assert d.from_user_input is False
+        assert "team-B" not in d.reason
+        assert "may only revoke" in d.reason
 
     def test_replacing_teams_wholesale_with_foreign_remaining(self):
-        """Wholesale replacement that removes foreign grants is rejected."""
+        """Wholesale replacement that removes foreign grants is rejected.
+
+        The stored team_ids that were dropped must not appear in the reason --
+        they're access list contents, not caller input.
+        """
         d = _decision(patch_info={"access": {"teams": ["team-T"]}})
         assert isinstance(d, Deny)
-        # team-A and team-B were both dropped; the caller admins neither.
-        assert "team-A" in d.reason or "team-B" in d.reason
+        assert d.from_user_input is False
+        assert "team-A" not in d.reason
+        assert "team-B" not in d.reason
 
 
 class TestTeamAdminRevoke:
@@ -194,7 +211,8 @@ class TestTeamAdminRevoke:
 
     def test_revoke_attempt_on_foreign_team_denied(self):
         """A patch that removes a foreign team is still rejected, even if
-        the caller is also revoking their own."""
+        the caller is also revoking their own. The foreign team_id MUST
+        NOT appear in the reason (stored access list content)."""
         existing = {
             **_EXISTING_INFO,
             "access": {"teams": ["team-A", "team-B", "team-T"]},
@@ -204,7 +222,8 @@ class TestTeamAdminRevoke:
             patch_info={"access": {"teams": ["team-A"]}},  # drops team-B AND team-T
         )
         assert isinstance(d, Deny)
-        assert "team-B" in d.reason
+        assert d.from_user_input is False
+        assert "team-B" not in d.reason
 
 
 class TestTeamAdminMultipleTeams:

@@ -22,6 +22,7 @@ import litellm
 import litellm.proxy.credential_endpoints.endpoints as endpoints
 from litellm.models.credentials import CredentialItem, UpdateCredentialItem
 from litellm.proxy._types import LitellmUserRoles, UserAPIKeyAuth
+from litellm.proxy.credential_endpoints.access_decision import OPAQUE_DENY_REASON
 from litellm.types.utils import CreateCredentialItem
 
 
@@ -536,7 +537,9 @@ async def test_team_admin_cannot_rotate_credential_values(
             user_api_key_dict=_team_admin_of(["team-T"]),
         )
     assert exc.value.status_code == 403
-    assert "credential_values" in exc.value.detail["error"]
+    # Endpoint collapses non-caller-input Deny reasons to the opaque message
+    # so PATCH /credentials/{name} can't be used as an existence oracle.
+    assert exc.value.detail["error"] == OPAQUE_DENY_REASON
 
 
 @pytest.mark.asyncio
@@ -559,7 +562,7 @@ async def test_team_admin_cannot_flip_global(
             user_api_key_dict=_team_admin_of(["team-T"]),
         )
     assert exc.value.status_code == 403
-    assert "global" in exc.value.detail["error"]
+    assert exc.value.detail["error"] == OPAQUE_DENY_REASON
 
 
 @pytest.mark.asyncio
@@ -627,6 +630,92 @@ async def test_get_credentials_forbidden_for_plain_user(
         )
     assert exc.value.status_code == 403
     assert "team-admin" in exc.value.detail["error"]
+
+
+@pytest.mark.asyncio
+async def test_patch_credentials_does_not_leak_credential_type(
+    _connected_db, _patch_team_admin_lookup, monkeypatch
+):
+    """Existence-oracle regression: a team-admin probing a credential they don't own
+    must NOT be able to distinguish "logging credential, not yours" from
+    "provider credential" or "doesn't exist" by comparing 403 detail strings.
+
+    Pre-fix the decider returned reasons like "access.global is proxy-admin only"
+    while `_require_proxy_admin` returned a fixed string, so the same probe
+    (e.g. PATCH `{credential_info: {access: {global: true}}}`) would yield
+    different bodies depending on the stored type. All three paths now return
+    the same opaque message.
+    """
+    provider = CredentialItem(
+        credential_name="openai-prod",
+        credential_values={"api_key": "sk-real"},
+        credential_info={"custom_llm_provider": "openai"},
+    )
+    logging_other = CredentialItem(
+        credential_name="other-langfuse",
+        credential_values={"langfuse_host": "h"},
+        credential_info={
+            "credential_type": "logging",
+            "description": "tenant Langfuse",
+            "host": "https://cloud.langfuse.com",
+            "access": {"teams": ["team-other"]},
+        },
+    )
+    monkeypatch.setattr(litellm, "credential_list", [provider, logging_other])
+    _connected_db.find_by_name = AsyncMock(
+        side_effect=lambda name: provider if name == "openai-prod" else logging_other
+    )
+    # Caller is team-admin of team-T (NOT team-other, so can't legitimately
+    # edit logging_other either), probing with a patch that touches a
+    # decider-protected field to maximally expose any branch divergence.
+    _patch_team_admin_lookup["ids"] = frozenset({"team-T"})
+    probe_patch = UpdateCredentialItem(
+        credential_info={"access": {"global": True}},
+    )
+
+    bodies: list[object] = []
+    for name in ("openai-prod", "other-langfuse", "does-not-exist"):
+        with pytest.raises(HTTPException) as exc:
+            await endpoints.update_credential(
+                request=MagicMock(),
+                fastapi_response=MagicMock(),
+                credential=probe_patch,
+                credential_name=name,
+                user_api_key_dict=_team_admin_of(["team-T"]),
+            )
+        assert exc.value.status_code == 403
+        bodies.append(exc.value.detail)
+
+    assert bodies[0] == bodies[1] == bodies[2] == {"error": OPAQUE_DENY_REASON}
+
+
+@pytest.mark.asyncio
+async def test_patch_credentials_echoes_foreign_team_id_to_legit_team_admin(
+    _connected_db, _patch_team_admin_lookup, monkeypatch
+):
+    """The one accepted leak: when a team-admin tries to grant a team_id they
+    typed in the patch and don't admin, the response names that team_id so
+    the UI can render a useful error. The team_id was caller input, so it
+    isn't an existence oracle (the caller already knew the value).
+    """
+    monkeypatch.setattr(litellm, "credential_list", [_resident_logging_dest()])
+    _connected_db.find_by_name = AsyncMock(return_value=_resident_logging_dest())
+    _patch_team_admin_lookup["ids"] = frozenset({"team-T"})
+
+    with pytest.raises(HTTPException) as exc:
+        await endpoints.update_credential(
+            request=MagicMock(),
+            fastapi_response=MagicMock(),
+            credential=UpdateCredentialItem(
+                credential_info={
+                    "access": {"teams": ["team-existing", "team-foreign"]}
+                },
+            ),
+            credential_name="dest",
+            user_api_key_dict=_team_admin_of(["team-T"]),
+        )
+    assert exc.value.status_code == 403
+    assert "team-foreign" in exc.value.detail["error"]
 
 
 @pytest.mark.asyncio

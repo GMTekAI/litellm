@@ -1,7 +1,7 @@
 """Trace-context + Baggage helpers."""
 
 from contextvars import ContextVar
-from typing import Mapping
+from typing import TYPE_CHECKING, Mapping
 
 from opentelemetry import baggage
 from opentelemetry.context import Context, get_current
@@ -9,6 +9,9 @@ from opentelemetry.trace import Span, get_current_span, set_span_in_context
 from opentelemetry.trace.propagation.tracecontext import (
     TraceContextTextMapPropagator,
 )
+
+if TYPE_CHECKING:
+    from litellm.integrations.otel.model.destination import OtelDestination
 
 _PROPAGATOR = TraceContextTextMapPropagator()
 
@@ -40,17 +43,19 @@ _request_root_span: "ContextVar[Span | None]" = ContextVar(
 # ``asyncio.create_task`` children (the success/failure logging callbacks close
 # the LLM span in a worker copied from the request context). Request-scoped: the
 # contextvar dies with the request task, so nothing leaks across requests.
-_request_destinations: "ContextVar[tuple]" = ContextVar(
+_request_destinations: 'ContextVar[tuple["OtelDestination", ...]]' = ContextVar(
     "litellm_otel_request_destinations", default=()
 )
 
 
-def set_request_destinations(destinations: tuple) -> None:
+def set_request_destinations(
+    destinations: 'tuple["OtelDestination", ...]',
+) -> None:
     """Anchor the admin-resolved destinations for this request."""
     _request_destinations.set(tuple(destinations))
 
 
-def request_destinations() -> tuple:
+def request_destinations() -> 'tuple["OtelDestination", ...]':
     """Destinations the request fans out to, or empty when none were resolved."""
     return _request_destinations.get()
 

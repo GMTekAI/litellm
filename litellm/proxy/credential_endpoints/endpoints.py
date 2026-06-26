@@ -16,7 +16,11 @@ from litellm.litellm_core_utils.litellm_logging import _get_masked_values
 from litellm.proxy._types import CommonProxyErrors, LitellmUserRoles, UserAPIKeyAuth
 from litellm.proxy.auth.user_api_key_auth import user_api_key_auth
 from litellm.proxy.common_utils.encrypt_decrypt_utils import encrypt_value_helper
+from pydantic import ValidationError
+
+from litellm.models.credentials import CredentialInfo
 from litellm.proxy.credential_endpoints.access_decision import (
+    OPAQUE_DENY_REASON,
     Allow,
     Deny,
     decide_credential_patch,
@@ -46,6 +50,14 @@ def _require_proxy_admin(user_api_key_dict: UserAPIKeyAuth) -> None:
 
 def _is_proxy_admin(user_api_key_dict: UserAPIKeyAuth) -> bool:
     return user_api_key_dict.user_role == LitellmUserRoles.PROXY_ADMIN
+
+
+def _summarize_validation_error(ve: ValidationError) -> str:
+    parts = (
+        ".".join(str(loc) for loc in err["loc"]) + ": " + err["msg"]
+        for err in ve.errors()
+    )
+    return "; ".join(parts)
 
 
 async def _caller_grantable_team_ids(
@@ -517,6 +529,76 @@ def _merge_credential_info(into: dict, patch: dict) -> None:
     dependencies=[Depends(user_api_key_auth)],
     tags=["credential management"],
 )
+async def _authorize_credential_patch(
+    *,
+    credential_name: str,
+    patch: UpdateCredentialItem,
+    existing: Optional[CredentialItem],
+    user_api_key_dict: UserAPIKeyAuth,
+    prisma_client: "Optional[PrismaClient]",
+) -> None:
+    """Raise 403 unless the caller is allowed to apply ``patch`` to ``existing``.
+
+    The decider widening only applies when the STORED credential is a logging
+    destination -- a patch body alone can't promote a provider credential into
+    the decider's allowed paths (Cursor BugBot bypass: ``is_admin_gated_credential_info``
+    returned True for any patch carrying ``access``, so a team-admin could PATCH
+    ``access.teams`` onto a provider credential and reach the decider).
+    """
+    existing_is_logging_gated = existing is not None and is_admin_gated_credential_info(
+        existing.credential_info
+    )
+    if not existing_is_logging_gated:
+        _require_proxy_admin(user_api_key_dict)
+        return
+
+    is_admin = _is_proxy_admin(user_api_key_dict)
+    team_admin_ids = (
+        frozenset()
+        if is_admin
+        else await _caller_grantable_team_ids(user_api_key_dict, prisma_client)
+    )
+    try:
+        patch_info_typed = (
+            CredentialInfo.model_validate(patch.credential_info)
+            if patch.credential_info is not None
+            else None
+        )
+    except ValidationError as ve:
+        raise HTTPException(
+            status_code=400, detail={"error": _summarize_validation_error(ve)}
+        )
+    assert existing is not None  # narrowed by existing_is_logging_gated
+    existing_info_typed = CredentialInfo.model_validate(existing.credential_info)
+    decision = decide_credential_patch(
+        is_proxy_admin=is_admin,
+        caller_team_admin_ids=team_admin_ids,
+        existing_info=existing_info_typed,
+        patch_info=patch_info_typed,
+        patch_values=patch.credential_values,
+        patch_name_changed=(
+            patch.credential_name is not None
+            and patch.credential_name != credential_name
+        ),
+    )
+    if isinstance(decision, Deny):
+        reason = decision.reason if decision.from_user_input else OPAQUE_DENY_REASON
+        raise HTTPException(status_code=403, detail={"error": reason})
+    assert isinstance(decision, Allow)
+
+
+def _patch_to_credential_item(
+    patch: UpdateCredentialItem, credential_name: str
+) -> CredentialItem:
+    """Translate the partial PATCH body into the legacy CredentialItem shape
+    the downstream merge expects (non-None dicts)."""
+    return CredentialItem(
+        credential_name=patch.credential_name or credential_name,
+        credential_values=patch.credential_values or {},
+        credential_info=patch.credential_info or {},
+    )
+
+
 async def update_credential(
     request: Request,
     fastapi_response: Response,
@@ -537,49 +619,14 @@ async def update_credential(
     from litellm.proxy.proxy_server import prisma_client
 
     existing = await _credential_for_admin_gate(credential_name, prisma_client)
-    # The decider widening only applies when the STORED credential is a
-    # logging destination. A patch body alone can't promote a provider
-    # credential into the decider's allowed paths (Cursor BugBot caught the
-    # bypass: `is_admin_gated_credential_info(patch)` returned True for any
-    # patch carrying `access`, so a team-admin could PATCH `access.teams` onto
-    # a provider credential and reach the decider instead of the admin gate).
-    existing_is_logging_gated = existing is not None and is_admin_gated_credential_info(
-        existing.credential_info
+    await _authorize_credential_patch(
+        credential_name=credential_name,
+        patch=credential,
+        existing=existing,
+        user_api_key_dict=user_api_key_dict,
+        prisma_client=prisma_client,
     )
-    if existing_is_logging_gated:
-        is_admin = _is_proxy_admin(user_api_key_dict)
-        team_admin_ids = (
-            frozenset()
-            if is_admin
-            else await _caller_grantable_team_ids(user_api_key_dict, prisma_client)
-        )
-        decision = decide_credential_patch(
-            is_proxy_admin=is_admin,
-            caller_team_admin_ids=team_admin_ids,
-            existing_info=existing.credential_info,
-            patch_info=credential.credential_info,
-            patch_values=credential.credential_values,
-            patch_name_changed=(
-                credential.credential_name is not None
-                and credential.credential_name != credential_name
-            ),
-        )
-        if isinstance(decision, Deny):
-            raise HTTPException(status_code=403, detail={"error": decision.reason})
-        assert isinstance(decision, Allow)
-    else:
-        # Non-logging credential (provider, or credential not in DB).
-        # PATCH on these stays proxy-admin only across the board.
-        _require_proxy_admin(user_api_key_dict)
     validate_credential_access(credential.credential_info)
-
-    # Translate the partial patch into a full CredentialItem for the downstream
-    # merge function, which still expects the legacy shape with non-None dicts.
-    credential_as_item = CredentialItem(
-        credential_name=credential.credential_name or credential_name,
-        credential_values=credential.credential_values or {},
-        credential_info=credential.credential_info or {},
-    )
 
     try:
         if prisma_client is None:
@@ -591,7 +638,9 @@ async def update_credential(
         db_credential = await credentials_repository.find_by_name(credential_name)
         if db_credential is None:
             raise HTTPException(status_code=404, detail="Credential not found in DB.")
-        merged_credential = update_db_credential(db_credential, credential_as_item)
+        merged_credential = update_db_credential(
+            db_credential, _patch_to_credential_item(credential, credential_name)
+        )
         credential_object_jsonified = jsonify_object(merged_credential.model_dump())
         await credentials_repository.update_by_name(
             credential_name,
@@ -600,36 +649,51 @@ async def update_credential(
                 "updated_by": user_api_key_dict.user_id,
             },
         )
-
-        # Sync in-memory credential_list (skip if not in memory - e.g., proxy restarted)
-        new_name = merged_credential.credential_name
-        existing_in_memory: Optional[CredentialItem] = None
-        for cred in litellm.credential_list:
-            if cred.credential_name == credential_name:
-                existing_in_memory = cred
-                break
-
-        if existing_in_memory is not None:
-            in_memory_values = dict(existing_in_memory.credential_values or {})
-            if credential.credential_values:
-                in_memory_values.update(credential.credential_values)
-            in_memory_info = dict(existing_in_memory.credential_info or {})
-            if credential.credential_info:
-                _merge_credential_info(in_memory_info, credential.credential_info)
-            updated_in_memory = CredentialItem(
-                credential_name=new_name,
-                credential_values=in_memory_values,
-                credential_info=in_memory_info,
-            )
-            # Remove old entry if renamed, then use upsert_credentials to handle duplicates
-            if new_name != credential_name:
-                litellm.credential_list = [
-                    c
-                    for c in litellm.credential_list
-                    if c.credential_name != credential_name
-                ]
-            CredentialAccessor.upsert_credentials([updated_in_memory])
-
+        _sync_in_memory_credential(
+            old_name=credential_name,
+            merged=merged_credential,
+            patch=credential,
+        )
         return {"success": True, "message": "Credential updated successfully"}
     except Exception as e:
         return handle_exception_on_proxy(e)
+
+
+def _sync_in_memory_credential(
+    *,
+    old_name: str,
+    merged: CredentialItem,
+    patch: UpdateCredentialItem,
+) -> None:
+    """Mirror the DB write into ``litellm.credential_list``.
+
+    Skips when the credential isn't resident in memory (e.g. created on
+    another scaled instance, restored from DB on the next reload). The
+    in-memory ``credential_info`` is merged subfield-by-subfield via
+    ``_merge_credential_info`` so a partial patch can't clobber stored
+    ``access`` subfields it didn't touch.
+    """
+    existing_in_memory: Optional[CredentialItem] = None
+    for cred in litellm.credential_list:
+        if cred.credential_name == old_name:
+            existing_in_memory = cred
+            break
+    if existing_in_memory is None:
+        return
+
+    in_memory_values = dict(existing_in_memory.credential_values or {})
+    if patch.credential_values:
+        in_memory_values.update(patch.credential_values)
+    in_memory_info = dict(existing_in_memory.credential_info or {})
+    if patch.credential_info:
+        _merge_credential_info(in_memory_info, patch.credential_info)
+    updated_in_memory = CredentialItem(
+        credential_name=merged.credential_name,
+        credential_values=in_memory_values,
+        credential_info=in_memory_info,
+    )
+    if merged.credential_name != old_name:
+        litellm.credential_list = [
+            c for c in litellm.credential_list if c.credential_name != old_name
+        ]
+    CredentialAccessor.upsert_credentials([updated_in_memory])
