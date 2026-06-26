@@ -1465,11 +1465,14 @@ async def generate_key_fn(
     - user_id: (str) Unique user id - used for tracking spend across multiple keys for same user id.
     """
     try:
+        from litellm.proxy.management_endpoints.common_utils import (
+            _is_user_org_admin_for_team,
+            _is_user_team_admin,
+        )
         from litellm.proxy.management_endpoints.logging_exporter_validation import (
+            LOGGING_EXPORTERS_KEY,
             validate_logging_exporter_assignment,
         )
-
-        validate_logging_exporter_assignment(data.metadata, user_api_key_dict)
         from litellm.proxy._types import CommonProxyErrors
         from litellm.proxy.proxy_server import (
             prisma_client,
@@ -1569,6 +1572,29 @@ async def generate_key_fn(
             data=data,
             route=KeyManagementRoutes.KEY_GENERATE,
         )
+
+        # Team-admin of the key's team or org-admin of that team's org may
+        # write metadata.logging_exporters on team-owned keys. Personal keys
+        # (no team_table) stay proxy-admin only. Skip the role lookup when
+        # the field isn't in the payload to keep /key/generate cheap for the
+        # common case.
+        if isinstance(data.metadata, dict) and LOGGING_EXPORTERS_KEY in data.metadata:
+            validate_logging_exporter_assignment(
+                data.metadata,
+                user_api_key_dict,
+                caller_is_team_admin=(
+                    team_table is not None
+                    and _is_user_team_admin(
+                        user_api_key_dict=user_api_key_dict, team_obj=team_table
+                    )
+                ),
+                caller_is_org_admin=(
+                    team_table is not None
+                    and await _is_user_org_admin_for_team(
+                        user_api_key_dict=user_api_key_dict, team_obj=team_table
+                    )
+                ),
+            )
 
         if team_table is not None:
             await _check_team_key_limits(
@@ -2515,11 +2541,14 @@ async def update_key_fn(
     }'
     ```
     """
+    from litellm.proxy.management_endpoints.common_utils import (
+        _is_user_org_admin_for_team,
+        _is_user_team_admin,
+    )
     from litellm.proxy.management_endpoints.logging_exporter_validation import (
+        LOGGING_EXPORTERS_KEY,
         validate_logging_exporter_assignment,
     )
-
-    validate_logging_exporter_assignment(data.metadata, user_api_key_dict)
     from litellm.proxy.proxy_server import (
         llm_router,
         premium_user,
@@ -2549,6 +2578,40 @@ async def update_key_fn(
             token=data.key,
             prisma_client=prisma_client,
         )
+
+        # logging-exporters validation runs once the key's team is known so
+        # a team-admin or org-admin of that team can attach destinations.
+        # Skip the team lookup entirely when the field isn't being written.
+        if isinstance(data.metadata, dict) and LOGGING_EXPORTERS_KEY in data.metadata:
+            _key_team_id = getattr(existing_key_row, "team_id", None)
+            _key_team = None
+            if _key_team_id is not None:
+                try:
+                    _key_team = await get_team_object(
+                        team_id=_key_team_id,
+                        prisma_client=prisma_client,
+                        user_api_key_cache=user_api_key_cache,
+                        parent_otel_span=user_api_key_dict.parent_otel_span,
+                        check_db_only=True,
+                    )
+                except HTTPException:
+                    _key_team = None
+            validate_logging_exporter_assignment(
+                data.metadata,
+                user_api_key_dict,
+                caller_is_team_admin=(
+                    _key_team is not None
+                    and _is_user_team_admin(
+                        user_api_key_dict=user_api_key_dict, team_obj=_key_team
+                    )
+                ),
+                caller_is_org_admin=(
+                    _key_team is not None
+                    and await _is_user_org_admin_for_team(
+                        user_api_key_dict=user_api_key_dict, team_obj=_key_team
+                    )
+                ),
+            )
 
         await _validate_update_key_data(
             data=data,

@@ -2,9 +2,12 @@
 CRUD endpoints for storing reusable credentials.
 """
 
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Request, Response, Path
+from fastapi import APIRouter, Depends, HTTPException, Path, Request, Response
+
+if TYPE_CHECKING:
+    from litellm.proxy.utils import PrismaClient
 
 import litellm
 from litellm._logging import verbose_proxy_logger
@@ -13,13 +16,22 @@ from litellm.litellm_core_utils.litellm_logging import _get_masked_values
 from litellm.proxy._types import CommonProxyErrors, LitellmUserRoles, UserAPIKeyAuth
 from litellm.proxy.auth.user_api_key_auth import user_api_key_auth
 from litellm.proxy.common_utils.encrypt_decrypt_utils import encrypt_value_helper
+from litellm.proxy.credential_endpoints.access_decision import (
+    Allow,
+    Deny,
+    decide_credential_patch,
+)
 from litellm.proxy.management_endpoints.logging_exporter_validation import (
     is_admin_gated_credential_info,
     validate_credential_access,
 )
 from litellm.proxy.utils import handle_exception_on_proxy, jsonify_object
 from litellm.repositories.credentials_repository import CredentialsRepository
-from litellm.types.utils import CreateCredentialItem, CredentialItem
+from litellm.types.utils import (
+    CreateCredentialItem,
+    CredentialItem,
+    UpdateCredentialItem,
+)
 
 router = APIRouter()
 
@@ -30,6 +42,87 @@ def _require_proxy_admin(user_api_key_dict: UserAPIKeyAuth) -> None:
             status_code=403,
             detail={"error": "Only the proxy admin can manage logging credentials"},
         )
+
+
+def _is_proxy_admin(user_api_key_dict: UserAPIKeyAuth) -> bool:
+    return user_api_key_dict.user_role == LitellmUserRoles.PROXY_ADMIN
+
+
+async def _caller_grantable_team_ids(
+    user_api_key_dict: UserAPIKeyAuth, prisma_client: "Optional[PrismaClient]"
+) -> frozenset[str]:
+    """Team ids the caller may add to / remove from a destination's access.teams.
+
+    Two paths to grantability:
+
+    1. Direct team-admin: caller is admin of the team (role=admin in
+       ``members_with_roles``).
+    2. Via org-admin: caller is ORG_ADMIN of the team's organization. Org
+       admins manage every team in their org, even teams they aren't a
+       direct member of.
+
+    Empty when the caller has no user_id, no DB connection, or admins
+    nothing. Uses cached ``get_user_object`` / ``get_team_object`` plus one
+    bounded query for org teams; the role match is done in Python because
+    ``members_with_roles`` is a JSON column.
+    """
+    if user_api_key_dict.user_id is None or prisma_client is None:
+        return frozenset()
+    from litellm.proxy.auth.auth_checks import get_team_object, get_user_object
+    from litellm.proxy.proxy_server import proxy_logging_obj, user_api_key_cache
+
+    try:
+        user_obj = await get_user_object(
+            user_id=user_api_key_dict.user_id,
+            prisma_client=prisma_client,
+            user_api_key_cache=user_api_key_cache,
+            user_id_upsert=False,
+            parent_otel_span=user_api_key_dict.parent_otel_span,
+            proxy_logging_obj=proxy_logging_obj,
+        )
+        if user_obj is None:
+            return frozenset()
+
+        # Direct team-admin grants: walk the caller's own team list.
+        team_admin_of: set[str] = set()
+        for team_id in [
+            tid
+            for tid in (getattr(user_obj, "teams", None) or [])
+            if isinstance(tid, str)
+        ]:
+            team_obj = await get_team_object(
+                team_id=team_id,
+                prisma_client=prisma_client,
+                user_api_key_cache=user_api_key_cache,
+                parent_otel_span=user_api_key_dict.parent_otel_span,
+                proxy_logging_obj=proxy_logging_obj,
+            )
+            if any(
+                member.user_id == user_api_key_dict.user_id and member.role == "admin"
+                for member in (team_obj.members_with_roles or [])
+            ):
+                team_admin_of.add(team_id)
+
+        # Org-admin grants: every team in any org the caller admins, even if
+        # the caller isn't a direct member of that team.
+        org_admin_of: list[str] = [
+            m.organization_id
+            for m in (user_obj.organization_memberships or [])
+            if m.organization_id and m.user_role == LitellmUserRoles.ORG_ADMIN.value
+        ]
+        org_grantable: set[str] = set()
+        if org_admin_of:
+            org_teams = await prisma_client.db.litellm_teamtable.find_many(  # type: ignore[union-attr]
+                where={"organization_id": {"in": org_admin_of}}
+            )
+            org_grantable = {t.team_id for t in org_teams if t.team_id}
+
+        return frozenset(team_admin_of | org_grantable)
+    except Exception:
+        # Best-effort lookup. A miss here means the PATCH decider will deny any
+        # patch other than a no-op, which is the safe fallback.
+        verbose_proxy_logger.exception("team-admin lookup failed")
+        return frozenset()
 
 
 def _credential_in_memory(credential_name: str) -> Optional[CredentialItem]:
@@ -107,8 +200,10 @@ async def create_credential(
     """
     from litellm.proxy.proxy_server import llm_router, prisma_client
 
-    if is_admin_gated_credential_info(credential.credential_info):
-        _require_proxy_admin(user_api_key_dict)
+    # POST stays proxy-admin only across the board: route gate was widened so
+    # team-admins can PATCH access on existing logging destinations, but
+    # creation of any credential (logging or provider) remains admin-only.
+    _require_proxy_admin(user_api_key_dict)
     validate_credential_access(credential.credential_info)
 
     try:
@@ -178,15 +273,29 @@ async def get_credentials(
 ):
     """
     [BETA] endpoint. This might change unexpectedly.
+
+    Proxy admins see every credential (values masked). Team-admins see only
+    logging-typed destinations so they can self-assign them; provider
+    credentials stay invisible. Plain authenticated callers fall through the
+    same logging-only filter (route gate already requires team-admin status).
     """
     try:
+        visible = (
+            litellm.credential_list
+            if _is_proxy_admin(user_api_key_dict)
+            else [
+                credential
+                for credential in litellm.credential_list
+                if is_admin_gated_credential_info(credential.credential_info)
+            ]
+        )
         masked_credentials = [
             {
                 "credential_name": credential.credential_name,
                 "credential_values": _get_masked_values(credential.credential_values),
                 "credential_info": credential.credential_info,
             }
-            for credential in litellm.credential_list
+            for credential in visible
         ]
         return {"success": True, "credentials": masked_credentials}
     except Exception as e:
@@ -292,11 +401,9 @@ async def delete_credential(
     """
     from litellm.proxy.proxy_server import prisma_client
 
-    existing = await _credential_for_admin_gate(credential_name, prisma_client)
-    if existing is not None and is_admin_gated_credential_info(
-        existing.credential_info
-    ):
-        _require_proxy_admin(user_api_key_dict)
+    # DELETE stays proxy-admin only. The route gate lets team-admins reach
+    # /credentials/{name} for PATCH; reject any DELETE that isn't proxy-admin.
+    _require_proxy_admin(user_api_key_dict)
 
     try:
         if prisma_client is None:
@@ -368,7 +475,7 @@ def update_db_credential(
 async def update_credential(
     request: Request,
     fastapi_response: Response,
-    credential: CredentialItem,
+    credential: UpdateCredentialItem,
     credential_name: str = Path(
         ..., description="The credential name, percent-decoded; may contain slashes"
     ),
@@ -376,16 +483,55 @@ async def update_credential(
 ):
     """
     [BETA] endpoint. This might change unexpectedly.
+
+    Both ``credential_values`` and ``credential_info`` are optional; a team-admin
+    typically patches only ``credential_info.access`` to grant or revoke their
+    own team. A proxy admin may patch either or both. See
+    ``decide_credential_patch`` for the exact contract.
     """
     from litellm.proxy.proxy_server import prisma_client
 
     existing = await _credential_for_admin_gate(credential_name, prisma_client)
-    if is_admin_gated_credential_info(credential.credential_info) or (
-        existing is not None
-        and is_admin_gated_credential_info(existing.credential_info)
-    ):
+    existing_is_logging_gated = existing is not None and is_admin_gated_credential_info(
+        existing.credential_info
+    )
+    patch_is_logging_gated = is_admin_gated_credential_info(credential.credential_info)
+    if existing_is_logging_gated or patch_is_logging_gated:
+        is_admin = _is_proxy_admin(user_api_key_dict)
+        team_admin_ids = (
+            frozenset()
+            if is_admin
+            else await _caller_grantable_team_ids(user_api_key_dict, prisma_client)
+        )
+        decision = decide_credential_patch(
+            is_proxy_admin=is_admin,
+            caller_team_admin_ids=team_admin_ids,
+            existing_info=(existing.credential_info if existing is not None else None),
+            patch_info=credential.credential_info,
+            patch_values=credential.credential_values,
+            patch_name_changed=(
+                credential.credential_name is not None
+                and credential.credential_name != credential_name
+            ),
+        )
+        if isinstance(decision, Deny):
+            raise HTTPException(status_code=403, detail={"error": decision.reason})
+        assert isinstance(decision, Allow)
+    else:
+        # Non-logging (provider) credential. The route gate was widened to let
+        # team-admins reach this handler for logging-credential PATCHes; without
+        # this branch a non-admin caller could rotate a provider credential's
+        # api_key. PATCH on provider credentials remains proxy-admin only.
         _require_proxy_admin(user_api_key_dict)
     validate_credential_access(credential.credential_info)
+
+    # Translate the partial patch into a full CredentialItem for the downstream
+    # merge function, which still expects the legacy shape with non-None dicts.
+    credential_as_item = CredentialItem(
+        credential_name=credential.credential_name or credential_name,
+        credential_values=credential.credential_values or {},
+        credential_info=credential.credential_info or {},
+    )
 
     try:
         if prisma_client is None:
@@ -397,7 +543,7 @@ async def update_credential(
         db_credential = await credentials_repository.find_by_name(credential_name)
         if db_credential is None:
             raise HTTPException(status_code=404, detail="Credential not found in DB.")
-        merged_credential = update_db_credential(db_credential, credential)
+        merged_credential = update_db_credential(db_credential, credential_as_item)
         credential_object_jsonified = jsonify_object(merged_credential.model_dump())
         await credentials_repository.update_by_name(
             credential_name,

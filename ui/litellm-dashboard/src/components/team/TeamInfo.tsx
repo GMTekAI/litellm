@@ -563,7 +563,11 @@ const TeamInfoView: React.FC<TeamInfoProps> = ({
           ...(secretManagerSettings !== undefined ? { secret_manager_settings: secretManagerSettings } : {}),
         },
         ...(values.policies?.length > 0 ? { policies: values.policies } : {}),
-        ...(values.organization_id !== info.organization_id ? { organization_id: values.organization_id ?? null } : {}),
+        // organization_id always sent so the backend route gate can identify
+        // org-admin callers (the gate matches on body.organization_id; omitting
+        // it falls through to default-deny for a non-PROXY_ADMIN caller even
+        // if they admin the team's current org).
+        organization_id: values.organization_id !== undefined ? values.organization_id ?? null : info.organization_id,
       };
 
       updateData.max_budget = mapEmptyStringToNull(updateData.max_budget);
@@ -1455,7 +1459,7 @@ const TeamInfoView: React.FC<TeamInfoProps> = ({
                     <Form.Item
                       label="Logging Exporters"
                       name="logging_exporters"
-                      tooltip="Admin-owned trace destinations this team exports to. Resolved server-side and fanned out (added to the key's and org's). Manage destinations under Settings -> Logging Callbacks."
+                      tooltip="Trace destinations this team exports to. Resolved server-side and unioned with the key's and org's destinations. Destinations are created by the proxy admin; team admins may attach any of them to teams they admin."
                     >
                       <LoggingExportersSelect />
                     </Form.Item>
