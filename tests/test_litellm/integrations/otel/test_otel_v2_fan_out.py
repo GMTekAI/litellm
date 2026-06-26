@@ -35,6 +35,7 @@ from litellm.integrations.otel.plumbing.context import (  # noqa: E402
 )
 from litellm.integrations.otel.plumbing.fan_out import (  # noqa: E402
     TenantFanOutSpanProcessor,
+    _destination_resource_attrs,
     _processor_key,
 )
 from litellm.integrations.otel.plumbing import providers  # noqa: E402
@@ -57,9 +58,13 @@ def _build_provider_with_fan_out(
     test by an injected SimpleSpanProcessor against an in-memory exporter via
     ``monkeypatch`` so the test can read what was forwarded."""
     cfg = OpenTelemetryV2Config(exporter="in_memory")
-    provider = providers.build_tracer_provider(cfg, exporter=exporter, tenant_fan_out_owner=owner)
+    provider = providers.build_tracer_provider(
+        cfg, exporter=exporter, tenant_fan_out_owner=owner
+    )
     fan_out = next(
-        p for p in provider._active_span_processor._span_processors if isinstance(p, TenantFanOutSpanProcessor)
+        p
+        for p in provider._active_span_processor._span_processors
+        if isinstance(p, TenantFanOutSpanProcessor)
     )
     return provider, fan_out
 
@@ -78,7 +83,9 @@ def test_fan_out_forwards_span_to_matching_destination(monkeypatch):
     def _stub_processor_for(self, destination):
         return SimpleSpanProcessor(tenant_exporter)
 
-    monkeypatch.setattr(TenantFanOutSpanProcessor, "_processor_for", _stub_processor_for)
+    monkeypatch.setattr(
+        TenantFanOutSpanProcessor, "_processor_for", _stub_processor_for
+    )
 
     set_request_destinations(
         (
@@ -133,6 +140,24 @@ def test_fan_out_forwards_proxy_internal_spans_to_every_destination(monkeypatch)
 
     names = [s.name for s in tenant_exporter.get_finished_spans()]
     assert "auth" in names
+
+
+def test_arize_fan_out_uses_destination_project_over_env(monkeypatch):
+    monkeypatch.setenv("ARIZE_PROJECT_NAME", "global-project")
+    destination = OtelDestination(
+        callback_name="arize",
+        endpoint="https://otlp.arize.com/v1",
+        headers={"api_key": "k", "space_id": "s"},
+        resource_attributes={
+            "model_id": "tenant-project",
+            "arize.project.name": "tenant-project",
+        },
+    )
+
+    assert _destination_resource_attrs(destination) == {
+        "model_id": "tenant-project",
+        "arize.project.name": "tenant-project",
+    }
 
 
 def test_fan_out_skips_genai_span_to_avoid_double_export(monkeypatch):
@@ -221,8 +246,12 @@ def test_fan_out_caches_processor_per_destination_key(monkeypatch):
 
     monkeypatch.setattr(TenantFanOutSpanProcessor, "_processor_for", _stub)
 
-    dest_a = OtelDestination(callback_name="langfuse_otel", endpoint="https://a/", headers={"k": "1"})
-    dest_b = OtelDestination(callback_name="langfuse_otel", endpoint="https://b/", headers={"k": "1"})
+    dest_a = OtelDestination(
+        callback_name="langfuse_otel", endpoint="https://a/", headers={"k": "1"}
+    )
+    dest_b = OtelDestination(
+        callback_name="langfuse_otel", endpoint="https://b/", headers={"k": "1"}
+    )
     set_request_destinations((dest_a,))
     tracer = _provider.get_tracer("test")
     with tracer.start_as_current_span("s1"):

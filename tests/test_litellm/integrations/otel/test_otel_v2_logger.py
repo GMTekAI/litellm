@@ -587,6 +587,36 @@ def test_lazy_activation_emits_llm_span_when_destination_resolves(monkeypatch):
     assert len(dests) == 1 and dests[0].endpoint == "https://otlp.example.com/v1"
 
 
+def test_second_close_after_opened_call_does_not_emit_duplicate(monkeypatch):
+    logger, exporter = _logger()
+    monkeypatch.setattr(logger, "callback_name", "in_memory")
+    monkeypatch.setattr(
+        logger._tenant_tracers, "tracer_for", lambda default, destinations: default
+    )
+    server = logger._emitter.start_span(
+        SpanRole.PROXY_REQUEST, LITELLM_PROXY_REQUEST_SPAN_NAME
+    )
+    set_request_root_span(server)
+    kwargs = _kwargs()
+    kwargs["standard_callback_dynamic_params"] = {
+        "otel_destinations": [
+            {
+                "callback_name": "in_memory",
+                "endpoint": "https://otlp.example.com/v1",
+                "headers": {"api_key": "k"},
+            }
+        ]
+    }
+
+    logger.log_pre_api_call(model="gpt-4o", messages=[], kwargs=kwargs)
+    asyncio.run(logger.async_log_success_event(kwargs, None, None, None))
+    asyncio.run(logger.async_log_failure_event(kwargs, None, None, None))
+    server.end()
+
+    names = [s.name for s in exporter.get_finished_spans()]
+    assert names.count("chat gpt-4o") == 1
+
+
 def test_close_without_carrier_and_without_destination_drops_silently():
     """The pre-existing early-return semantics (auth gate / pre-call guardrail
     rejection with no destination resolving to this backend) must be preserved:

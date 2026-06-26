@@ -16,6 +16,7 @@ class OtelDestination(BaseModel):
 
     endpoint: str
     headers: dict[str, str] = Field(default_factory=dict)
+    resource_attributes: dict[str, str] = Field(default_factory=dict)
     # The OTEL backend (callback_name) this destination belongs to, so a request
     # that fans out across backends routes each destination to the logger that
     # owns its attribute vocabulary. None for the legacy single-destination path.

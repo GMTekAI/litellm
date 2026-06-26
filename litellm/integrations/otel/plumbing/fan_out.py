@@ -172,6 +172,8 @@ def _is_genai_span(span: ReadableSpan) -> bool:
 # rejects spans missing ``model_id`` (or the alternative ``arize.project.name``
 # span attribute); other backends accept the proxy's default Resource.
 def _destination_resource_attrs(destination: OtelDestination) -> dict[str, str]:
+    if destination.resource_attributes:
+        return dict(destination.resource_attributes)
     if destination.callback_name == "arize":
         project = os.environ.get("ARIZE_PROJECT_NAME")
         if project:

@@ -4820,7 +4820,11 @@ def _seeded_logging_credentials():
         ),
         CredentialItem(
             credential_name="arize-prod",
-            credential_values={"arize_space_id": "S", "arize_api_key": "K"},
+            credential_values={
+                "arize_space_id": "S",
+                "arize_api_key": "K",
+                "arize_project_name": "tenant-arize",
+            },
             credential_info={"credential_type": "logging", "description": "arize"},
         ),
         # A provider credential that must never resolve as a logging destination.
@@ -4902,6 +4906,29 @@ async def test_resolve_logging_exporters_unions_key_team_org(
 
 
 @pytest.mark.asyncio
+async def test_resolve_logging_exporters_carries_arize_project(
+    _seeded_logging_credentials,
+):
+    from litellm.proxy.litellm_pre_call_utils import _resolve_logging_exporters
+
+    destinations, _ = await _resolve_logging_exporters(
+        _auth(team_exporters=["arize-prod"])
+    )
+
+    assert destinations == [
+        {
+            "callback_name": "arize",
+            "endpoint": "https://otlp.arize.com/v1",
+            "headers": {"space_id": "S", "api_key": "K"},
+            "resource_attributes": {
+                "model_id": "tenant-arize",
+                "arize.project.name": "tenant-arize",
+            },
+        }
+    ]
+
+
+@pytest.mark.asyncio
 async def test_resolve_logging_exporters_empty_without_assignment(
     _seeded_logging_credentials,
 ):
@@ -4928,19 +4955,37 @@ async def test_resolve_logging_exporters_skips_unknown_and_provider_creds(
 async def test_apply_admin_logging_exporters_stamps_and_activates(
     _seeded_logging_credentials,
 ):
+    from litellm.integrations.otel.plumbing.context import (
+        _request_destinations,
+        request_destinations,
+    )
     from litellm.proxy.litellm_pre_call_utils import _apply_admin_logging_exporters
 
+    token = _request_destinations.set(())
     data: dict = {}
-    await _apply_admin_logging_exporters(data, _auth(team_exporters=["langfuse-eu"]))
+    try:
+        await _apply_admin_logging_exporters(
+            data, _auth(team_exporters=["langfuse-eu"])
+        )
 
-    # destinations live under litellm_metadata so the body does not leak an
-    # unknown top-level key to the provider; the top-level key stays absent
-    assert "otel_destinations" not in data
-    destinations = data["litellm_metadata"]["otel_destinations"]
-    assert destinations[0]["callback_name"] == "langfuse_otel"
-    assert destinations[0]["endpoint"] == "https://cloud.langfuse.com/api/public/otel"
-    # the backend is activated for the request
-    assert "langfuse_otel" in data["success_callback"]
+        # destinations live under litellm_metadata so the body does not leak an
+        # unknown top-level key to the provider; the top-level key stays absent
+        assert "otel_destinations" not in data
+        destinations = data["litellm_metadata"]["otel_destinations"]
+        assert destinations[0]["callback_name"] == "langfuse_otel"
+        assert (
+            destinations[0]["endpoint"] == "https://cloud.langfuse.com/api/public/otel"
+        )
+        # the backend is activated for the request
+        assert "langfuse_otel" in data["success_callback"]
+        context_destinations = request_destinations()
+        assert len(context_destinations) == 1
+        assert (
+            context_destinations[0].endpoint
+            == "https://cloud.langfuse.com/api/public/otel"
+        )
+    finally:
+        _request_destinations.reset(token)
 
 
 _LANGFUSE_ENDPOINT = "https://cloud.langfuse.com/api/public/otel"

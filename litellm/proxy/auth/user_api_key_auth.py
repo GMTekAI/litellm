@@ -979,6 +979,7 @@ async def _hoist_request_destinations(
                 callback_name=item.get("callback_name"),
                 endpoint=item.get("endpoint", ""),
                 headers=item.get("headers") or {},
+                resource_attributes=item.get("resource_attributes") or {},
             )
             for item in destinations_raw
             if isinstance(item, dict) and item.get("endpoint")
@@ -1398,6 +1399,8 @@ async def _user_api_key_auth_builder(
                             valid_token = auto_registered
                             api_key = valid_token.token or ""
 
+                    await _hoist_request_destinations(request, valid_token)
+
                     # Check if model has zero cost - if so, skip all budget checks
                     model = _get_model_from_request_context(
                         request_data=request_data,
@@ -1762,6 +1765,8 @@ async def _user_api_key_auth_builder(
         user_obj: Optional[LiteLLM_UserTable] = None
         valid_token_dict: dict = {}
         if valid_token is not None:
+            valid_token.parent_otel_span = parent_otel_span
+            await _hoist_request_destinations(request, valid_token)
             # Got Valid Token from Cache, DB
             # Run checks for
             # 1. If token can call model

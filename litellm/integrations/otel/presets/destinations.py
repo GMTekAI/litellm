@@ -55,8 +55,14 @@ def _arize_destination(values: Mapping[str, str]) -> Optional[OtelDestination]:
     if not space or not api_key:
         return None
     endpoint = values.get("arize_endpoint") or "https://otlp.arize.com/v1"
+    project = values.get("arize_project_name") or values.get("project_name")
+    resource_attributes = (
+        {"model_id": project, "arize.project.name": project} if project else {}
+    )
     return OtelDestination(
-        endpoint=endpoint, headers={"space_id": space, "api_key": api_key}
+        endpoint=endpoint,
+        headers={"space_id": space, "api_key": api_key},
+        resource_attributes=resource_attributes,
     )
 
 

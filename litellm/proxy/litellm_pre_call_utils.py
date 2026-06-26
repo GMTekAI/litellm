@@ -663,7 +663,11 @@ async def _resolve_logging_exporters(
         if (result := _build(credential)) is not None
     )
     deduped = {
-        (destination.endpoint, tuple(sorted(destination.headers.items()))): (
+        (
+            destination.endpoint,
+            tuple(sorted(destination.headers.items())),
+            tuple(sorted(destination.resource_attributes.items())),
+        ): (
             backend,
             destination,
         )
@@ -674,11 +678,37 @@ async def _resolve_logging_exporters(
             "callback_name": backend,
             "endpoint": destination.endpoint,
             "headers": destination.headers,
+            "resource_attributes": destination.resource_attributes,
         }
         for backend, destination in deduped.values()
     ]
     backends = list(dict.fromkeys(backend for backend, _ in deduped.values()))
     return destinations, backends
+
+
+def _request_destination_from_raw(item: object) -> "OtelDestination | None":
+    from litellm.integrations.otel.model.destination import OtelDestination
+
+    if isinstance(item, OtelDestination):
+        return item
+    if not isinstance(item, dict) or not item.get("endpoint"):
+        return None
+    try:
+        return OtelDestination.model_validate(item)
+    except PydanticValidationError:
+        return None
+
+
+def _set_request_otel_destinations(destinations: list) -> None:
+    from litellm.integrations.otel.plumbing.context import set_request_destinations
+
+    set_request_destinations(
+        tuple(
+            destination
+            for item in destinations
+            if (destination := _request_destination_from_raw(item)) is not None
+        )
+    )
 
 
 async def _apply_admin_logging_exporters(
@@ -712,6 +742,7 @@ async def _apply_admin_logging_exporters(
         destinations, backends = await _resolve_logging_exporters(user_api_key_dict)
     if not destinations:
         return
+    _set_request_otel_destinations(destinations)
     proxy_metadata = data.get("litellm_metadata")
     if not isinstance(proxy_metadata, dict):
         proxy_metadata = {}

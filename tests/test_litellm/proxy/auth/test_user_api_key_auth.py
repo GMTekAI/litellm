@@ -3786,3 +3786,34 @@ async def test_builder_succeeds_when_db_lookup_returns_valid_token():
     # Reaching the success-assembly return (never the exception handler)
     # proves a valid key is unaffected by the 503 conversion.
     mock_return.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_builder_hoists_destinations_before_post_lookup_auth_checks():
+    valid_token = UserAPIKeyAuth(api_key="sk-db-lookup-test", token="hashed-valid")
+    get_key_object = AsyncMock(return_value=valid_token)
+
+    async def _assert_hoisted_first(*args, **kwargs):
+        assert mock_hoist.await_count == 1
+
+    with (
+        patch(
+            "litellm.proxy.auth.user_api_key_auth._return_user_api_key_auth_obj",
+            new_callable=AsyncMock,
+            return_value=valid_token,
+        ),
+        patch(
+            "litellm.proxy.auth.user_api_key_auth._hoist_request_destinations",
+            new_callable=AsyncMock,
+        ) as mock_hoist,
+        patch(
+            "litellm.proxy.auth.user_api_key_auth._enforce_key_and_fallback_model_access",
+            new_callable=AsyncMock,
+            side_effect=_assert_hoisted_first,
+        ) as mock_enforce,
+    ):
+        result = await _run_builder_with_key_lookup(get_key_object)
+
+    assert result is valid_token
+    mock_hoist.assert_awaited_once()
+    mock_enforce.assert_awaited_once()
