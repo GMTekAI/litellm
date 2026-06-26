@@ -492,11 +492,16 @@ async def update_credential(
     from litellm.proxy.proxy_server import prisma_client
 
     existing = await _credential_for_admin_gate(credential_name, prisma_client)
+    # The decider widening only applies when the STORED credential is a
+    # logging destination. A patch body alone can't promote a provider
+    # credential into the decider's allowed paths (Cursor BugBot caught the
+    # bypass: `is_admin_gated_credential_info(patch)` returned True for any
+    # patch carrying `access`, so a team-admin could PATCH `access.teams` onto
+    # a provider credential and reach the decider instead of the admin gate).
     existing_is_logging_gated = existing is not None and is_admin_gated_credential_info(
         existing.credential_info
     )
-    patch_is_logging_gated = is_admin_gated_credential_info(credential.credential_info)
-    if existing_is_logging_gated or patch_is_logging_gated:
+    if existing_is_logging_gated:
         is_admin = _is_proxy_admin(user_api_key_dict)
         team_admin_ids = (
             frozenset()
@@ -506,7 +511,7 @@ async def update_credential(
         decision = decide_credential_patch(
             is_proxy_admin=is_admin,
             caller_team_admin_ids=team_admin_ids,
-            existing_info=(existing.credential_info if existing is not None else None),
+            existing_info=existing.credential_info,
             patch_info=credential.credential_info,
             patch_values=credential.credential_values,
             patch_name_changed=(
@@ -518,10 +523,8 @@ async def update_credential(
             raise HTTPException(status_code=403, detail={"error": decision.reason})
         assert isinstance(decision, Allow)
     else:
-        # Non-logging (provider) credential. The route gate was widened to let
-        # team-admins reach this handler for logging-credential PATCHes; without
-        # this branch a non-admin caller could rotate a provider credential's
-        # api_key. PATCH on provider credentials remains proxy-admin only.
+        # Non-logging credential (provider, or credential not in DB).
+        # PATCH on these stays proxy-admin only across the board.
         _require_proxy_admin(user_api_key_dict)
     validate_credential_access(credential.credential_info)
 

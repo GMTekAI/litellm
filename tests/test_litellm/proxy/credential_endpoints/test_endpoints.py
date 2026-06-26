@@ -20,7 +20,7 @@ sys.path.insert(0, os.path.abspath("../../../.."))
 
 import litellm
 import litellm.proxy.credential_endpoints.endpoints as endpoints
-from litellm.models.credentials import CredentialItem
+from litellm.models.credentials import CredentialItem, UpdateCredentialItem
 from litellm.proxy._types import LitellmUserRoles, UserAPIKeyAuth
 from litellm.types.utils import CreateCredentialItem
 
@@ -371,6 +371,45 @@ async def test_provider_credential_patch_forbidden_for_non_admin(
             ),
             credential_name="openai-prod",
             user_api_key_dict=_member(),
+        )
+    assert exc.value.status_code == 403
+    _connected_db.update_by_name.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_provider_credential_access_patch_bypass_forbidden(
+    _connected_db, _patch_team_admin_lookup, monkeypatch
+):
+    """Cursor BugBot regression: a team-admin can't sneak `access.teams` onto
+    a PROVIDER credential to route through the decider instead of the admin
+    gate.
+
+    `is_admin_gated_credential_info(patch)` returns True for any patch
+    containing an `access` field, so previously a team-admin could PATCH a
+    provider credential with `{credential_info: {access: {teams: [...]}}}`
+    and reach `decide_credential_patch`, which would Allow because the patch
+    is just "add own team to access.teams". Gate must look at the STORED
+    credential's type, not the patch body.
+    """
+    provider_cred = CredentialItem(
+        credential_name="openai-prod",
+        credential_values={"api_key": "sk-real"},
+        credential_info={"custom_llm_provider": "openai"},
+    )
+    monkeypatch.setattr(litellm, "credential_list", [provider_cred])
+    _connected_db.find_by_name = AsyncMock(return_value=provider_cred)
+    _connected_db.update_by_name = AsyncMock()
+    _patch_team_admin_lookup["ids"] = frozenset({"team-T"})
+
+    with pytest.raises(HTTPException) as exc:
+        await endpoints.update_credential(
+            request=MagicMock(),
+            fastapi_response=MagicMock(),
+            credential=UpdateCredentialItem(
+                credential_info={"access": {"teams": ["team-T"]}},
+            ),
+            credential_name="openai-prod",
+            user_api_key_dict=_team_admin_of(["team-T"]),
         )
     assert exc.value.status_code == 403
     _connected_db.update_by_name.assert_not_awaited()
