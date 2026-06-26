@@ -524,11 +524,6 @@ def _merge_credential_info(into: dict, patch: dict) -> None:
         into["access"] = patch_access
 
 
-@router.patch(
-    "/credentials/{credential_name:path}",
-    dependencies=[Depends(user_api_key_auth)],
-    tags=["credential management"],
-)
 async def _authorize_credential_patch(
     *,
     credential_name: str,
@@ -599,6 +594,11 @@ def _patch_to_credential_item(
     )
 
 
+@router.patch(
+    "/credentials/{credential_name:path}",
+    dependencies=[Depends(user_api_key_auth)],
+    tags=["credential management"],
+)
 async def update_credential(
     request: Request,
     fastapi_response: Response,

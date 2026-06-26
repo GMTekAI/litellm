@@ -632,6 +632,25 @@ async def test_get_credentials_forbidden_for_plain_user(
     assert "team-admin" in exc.value.detail["error"]
 
 
+def test_patch_credentials_route_targets_update_credential():
+    """Regression: the @router.patch decorator on /credentials/{name:path} must
+    decorate update_credential, not one of the extracted helpers. A misplaced
+    decorator landed once during the 7ecc1d49 split and the unit tests didn't
+    catch it because they import the handler function directly; this asserts
+    the FastAPI routing table actually points at update_credential.
+    """
+    from fastapi.routing import APIRoute
+
+    patch_route = next(
+        route
+        for route in endpoints.router.routes
+        if isinstance(route, APIRoute)
+        and route.path == "/credentials/{credential_name:path}"
+        and "PATCH" in route.methods
+    )
+    assert patch_route.endpoint is endpoints.update_credential
+
+
 @pytest.mark.asyncio
 async def test_patch_credentials_does_not_leak_credential_type(
     _connected_db, _patch_team_admin_lookup, monkeypatch
