@@ -78,6 +78,18 @@ def test_init_empty_checks_falls_back_to_apply_mode():
     assert g.checks is None  # empty checks => ApplyGuardrail path, no conflict
 
 
+def test_init_all_unknown_checks_without_identifier_raises():
+    with pytest.raises(ValueError, match="no recognized keys"):
+        BedrockGuardrail(checks={"contentFilterr": {"categories": []}})
+
+
+def test_init_all_unknown_checks_with_identifier_falls_back_to_apply_mode():
+    g = BedrockGuardrail(
+        guardrailIdentifier="gid", checks={"contentFilterr": {"categories": []}}
+    )
+    assert g.checks is None  # unknown checks dropped, ApplyGuardrail via identifier
+
+
 def test_normalize_checks_partial_unknown_warns_checks_mode_continues():
     with patch(
         "litellm.proxy.guardrails.guardrail_hooks.bedrock_guardrails.verbose_proxy_logger.warning"

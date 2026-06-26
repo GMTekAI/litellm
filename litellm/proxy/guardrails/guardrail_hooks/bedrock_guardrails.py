@@ -214,6 +214,20 @@ class BedrockGuardrail(CustomGuardrail, BaseAWSLLM):
                 "or 'checks' (InvokeGuardrailChecks), not both."
             )
 
+        # A `checks` config whose keys are all unrecognized normalizes to None. With no
+        # guardrailIdentifier to fall back to, that would silently leave the guardrail
+        # unenforced, so fail closed with an actionable error instead.
+        if (
+            self.checks is None
+            and self.guardrailIdentifier is None
+            and self._checks_all_unrecognized(checks)
+        ):
+            raise ValueError(
+                "Bedrock guardrail 'checks' contained no recognized keys "
+                f"(known keys: {sorted(_BEDROCK_CHECKS_KNOWN_KEYS)}); set a valid check "
+                "or a 'guardrailIdentifier' for ApplyGuardrail mode."
+            )
+
         # Set supported event hooks to include MCP hooks
         if "supported_event_hooks" not in kwargs:
             kwargs["supported_event_hooks"] = [
@@ -244,6 +258,18 @@ class BedrockGuardrail(CustomGuardrail, BaseAWSLLM):
             self.guardrailVersion,
             list(self.checks.keys()) if self.checks else None,
         )
+
+    @staticmethod
+    def _checks_all_unrecognized(checks: object | None) -> bool:
+        """True when `checks` was configured with content but no recognized key survived."""
+        if checks is None:
+            return False
+        if hasattr(checks, "model_dump"):
+            checks = checks.model_dump(exclude_none=True)
+        if not isinstance(checks, dict):
+            return False
+        provided = {key for key, value in checks.items() if value is not None}
+        return bool(provided) and not (provided & _BEDROCK_CHECKS_KNOWN_KEYS)
 
     @staticmethod
     def _normalize_checks(checks: object | None) -> dict[str, Any] | None:
