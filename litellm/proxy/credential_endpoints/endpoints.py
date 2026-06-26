@@ -274,21 +274,38 @@ async def get_credentials(
     """
     [BETA] endpoint. This might change unexpectedly.
 
-    Proxy admins see every credential (values masked). Team-admins see only
-    logging-typed destinations so they can self-assign them; provider
-    credentials stay invisible. Plain authenticated callers fall through the
-    same logging-only filter (route gate already requires team-admin status).
+    Proxy admins see every credential (values masked). Team-admins and
+    org-admins see only logging-typed destinations so they can self-assign
+    them; provider credentials stay invisible to non-PROXY_ADMINs. Plain
+    internal users with no team-admin or org-admin status get 403 — they
+    have no use for the list and shouldn't see destination names, hosts,
+    or scope metadata (Veria F2).
     """
+    from litellm.proxy.proxy_server import prisma_client
+
     try:
-        visible = (
-            litellm.credential_list
-            if _is_proxy_admin(user_api_key_dict)
-            else [
+        if _is_proxy_admin(user_api_key_dict):
+            visible = list(litellm.credential_list)
+        else:
+            grantable = await _caller_grantable_team_ids(
+                user_api_key_dict, prisma_client
+            )
+            if not grantable:
+                raise HTTPException(
+                    status_code=403,
+                    detail={
+                        "error": (
+                            "Listing logging destinations requires team-admin or "
+                            "org-admin status. Ask your proxy admin to add you to a "
+                            "team or org."
+                        )
+                    },
+                )
+            visible = [
                 credential
                 for credential in litellm.credential_list
                 if is_admin_gated_credential_info(credential.credential_info)
             ]
-        )
         masked_credentials = [
             {
                 "credential_name": credential.credential_name,
@@ -298,6 +315,8 @@ async def get_credentials(
             for credential in visible
         ]
         return {"success": True, "credentials": masked_credentials}
+    except HTTPException:
+        raise
     except Exception as e:
         return handle_exception_on_proxy(e)
 
@@ -456,15 +475,41 @@ def update_db_credential(
         merged_credential.credential_values.update(encrypted_params)
 
     # Merge the patch into the existing credential_info so a partial update (e.g. only
-    # access) preserves credential_type/description/host. The prior guard checked for a
-    # key literally named "credential_info", which is never present, so it reset the dict
-    # on every patch and dropped the logging tag.
+    # access.teams) preserves credential_type/description/host AND the untouched
+    # access subfields (global/orgs/other teams in access). See
+    # _merge_credential_info for the surgical-access reasoning.
     if encrypted_credential.credential_info:
         if merged_credential.credential_info is None:
             merged_credential.credential_info = {}
-        merged_credential.credential_info.update(encrypted_credential.credential_info)
+        _merge_credential_info(
+            merged_credential.credential_info, encrypted_credential.credential_info
+        )
 
     return merged_credential
+
+
+def _merge_credential_info(into: dict, patch: dict) -> None:
+    """Merge ``patch`` into ``into`` in place, with surgical access subfields.
+
+    A prior top-level dict.update let a patch like ``{access: {teams: [...]}}``
+    replace the entire stored ``access`` object, wiping ``access.global=true``
+    and ``access.orgs`` entries that the decider intentionally protected by
+    refusing to allow them in the patch (Veria F1: scope tampering). Now
+    ``access`` is merged subfield-by-subfield, so a non-admin patch carrying
+    only ``access.teams`` keeps existing ``access.global`` / ``access.orgs``
+    intact. The DB write and the in-memory cache sync both call this so the
+    two stores can't drift.
+    """
+    patch_copy = dict(patch)
+    patch_access = patch_copy.pop("access", None)
+    into.update(patch_copy)
+    if patch_access is None:
+        return
+    existing_access = into.get("access")
+    if isinstance(existing_access, dict) and isinstance(patch_access, dict):
+        existing_access.update(patch_access)
+    else:
+        into["access"] = patch_access
 
 
 @router.patch(
@@ -570,7 +615,7 @@ async def update_credential(
                 in_memory_values.update(credential.credential_values)
             in_memory_info = dict(existing_in_memory.credential_info or {})
             if credential.credential_info:
-                in_memory_info.update(credential.credential_info)
+                _merge_credential_info(in_memory_info, credential.credential_info)
             updated_in_memory = CredentialItem(
                 credential_name=new_name,
                 credential_values=in_memory_values,

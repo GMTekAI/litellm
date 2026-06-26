@@ -191,6 +191,47 @@ def test_update_db_credential_preserves_existing_info_on_partial_patch():
     }
 
 
+def test_update_db_credential_preserves_untouched_access_subfields():
+    """Veria regression: an access patch carrying only `teams` must NOT clobber
+    existing `global` / `orgs`. Pre-fix this caused a scope-tampering bug —
+    the decider only allowed team-admin patches that touched access.teams,
+    but the merge replaced the entire access object, silently dropping
+    access.global=true and any access.orgs entries.
+    """
+    from litellm.proxy.credential_endpoints.endpoints import update_db_credential
+
+    db = CredentialItem(
+        credential_name="dest",
+        credential_values={},
+        credential_info={
+            "credential_type": "logging",
+            "description": "langfuse_otel",
+            "host": "h",
+            "access": {
+                "global": True,
+                "orgs": ["org-1", "org-2"],
+                "teams": ["team-A"],
+            },
+        },
+    )
+    # Team-admin's allowed shape: add their team to access.teams. Crucially,
+    # they don't (and per the decider can't) include global/orgs.
+    patch = CredentialItem(
+        credential_name="dest",
+        credential_values={},
+        credential_info={"access": {"teams": ["team-A", "team-T"]}},
+    )
+
+    merged = update_db_credential(db, patch)
+
+    # access.global and access.orgs survive untouched; access.teams is updated.
+    assert merged.credential_info["access"] == {
+        "global": True,
+        "orgs": ["org-1", "org-2"],
+        "teams": ["team-A", "team-T"],
+    }
+
+
 @pytest.mark.asyncio
 async def test_delete_logging_credential_forbidden_for_non_admin(
     _connected_db, monkeypatch
@@ -522,7 +563,9 @@ async def test_team_admin_cannot_flip_global(
 
 
 @pytest.mark.asyncio
-async def test_get_credentials_filters_to_logging_for_non_admin(monkeypatch):
+async def test_get_credentials_filters_to_logging_for_non_admin(
+    monkeypatch, _patch_team_admin_lookup
+):
     monkeypatch.setattr(
         litellm,
         "credential_list",
@@ -539,6 +582,7 @@ async def test_get_credentials_filters_to_logging_for_non_admin(monkeypatch):
             ),
         ],
     )
+    _patch_team_admin_lookup["ids"] = frozenset({"team-T"})
     response = await endpoints.get_credentials(
         request=MagicMock(),
         fastapi_response=MagicMock(),
@@ -546,6 +590,43 @@ async def test_get_credentials_filters_to_logging_for_non_admin(monkeypatch):
     )
     names = [c["credential_name"] for c in response["credentials"]]
     assert names == ["poc-langfuse"]
+
+
+@pytest.mark.asyncio
+async def test_get_credentials_forbidden_for_plain_user(
+    monkeypatch, _patch_team_admin_lookup
+):
+    """Veria F2 regression: a plain internal_user (no team-admin or
+    org-admin status anywhere) gets 403, NOT a filtered list. The previous
+    handler returned destination names, hosts, and scope metadata to any
+    authenticated caller because the route gate was widened to support
+    team-admin self-assignment.
+    """
+    monkeypatch.setattr(
+        litellm,
+        "credential_list",
+        [
+            CredentialItem(
+                credential_name="poc-langfuse",
+                credential_values={"public_key": "pk-1"},
+                credential_info=_DEST_WITH_TEAMS,
+            ),
+        ],
+    )
+    _patch_team_admin_lookup["ids"] = frozenset()  # admins nothing
+
+    with pytest.raises(HTTPException) as exc:
+        await endpoints.get_credentials(
+            request=MagicMock(),
+            fastapi_response=MagicMock(),
+            user_api_key_dict=UserAPIKeyAuth(
+                api_key="k",
+                user_role=LitellmUserRoles.INTERNAL_USER,
+                user_id="plain-user",
+            ),
+        )
+    assert exc.value.status_code == 403
+    assert "team-admin" in exc.value.detail["error"]
 
 
 @pytest.mark.asyncio
