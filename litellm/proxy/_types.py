@@ -1010,11 +1010,14 @@ from litellm.models.team import BudgetLimitEntry as BudgetLimitEntry  # noqa: E4
 
 class PermissionsDict(TypedDict, total=False):
     """Plain-dict mirror of the `permissions` field on a key request. Names the
-    keys actually read by the proxy so callers and readers share one source of
-    truth; `total=False` lets forward-compat keys pass without a schema bump."""
+    keys the proxy actually reads off the dict: `get_spend_routes` (gates the
+    global spend routes in route_checks) and `enable_llm_guard_check` (gates
+    the enterprise LLM-guard callback). Other keys are still valid at runtime;
+    guardrail_helpers iterates the dict as `{guardrail_name: should_run}`, so
+    `total=False` lets those user-defined keys pass without a schema bump."""
 
-    allow_pii_controls: bool
     get_spend_routes: bool
+    enable_llm_guard_check: bool
 
 
 class GenerateRequestBase(LiteLLMPydanticObjectBase):

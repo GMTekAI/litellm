@@ -1450,7 +1450,7 @@ async def generate_key_fn(
     - guardrails: Optional[List[str]] - List of active guardrails for the key
     - policies: Optional[List[str]] - List of policy names to apply to the key. Policies define guardrails, conditions, and inheritance rules.
     - disable_global_guardrails: Optional[bool] - Whether to disable global guardrails for the key.
-    - permissions: Optional[dict] - key-specific permissions. Proxy-admin-only field; non-admin callers must leave this empty. Example - {"allow_pii_controls": true}
+    - permissions: Optional[dict] - key-specific permissions. Proxy-admin-only field; non-admin callers must leave this empty. Example - {"get_spend_routes": true}
     - model_max_budget: Optional[Dict[str, BudgetConfig]] - Model-specific budgets {"gpt-4": {"budget_limit": 0.0005, "time_period": "30d"}}}. IF null or {} then no model specific budget.
     - model_rpm_limit: Optional[dict] - key-specific model rpm limit. Example - {"text-davinci-002": 1000, "gpt-3.5-turbo": 1000}. IF null or {} then no model specific rpm limit.
     - model_tpm_limit: Optional[dict] - key-specific model tpm limit. Example - {"text-davinci-002": 1000, "gpt-3.5-turbo": 1000}. IF null or {} then no model specific tpm limit.
@@ -1487,7 +1487,7 @@ async def generate_key_fn(
         --header 'Authorization: Bearer sk-1234' \
         --header 'Content-Type: application/json' \
         --data '{
-            "permissions": {"allow_pii_controls": true}
+            "permissions": {"get_spend_routes": true}
     }'
     ```
 
@@ -1655,7 +1655,7 @@ async def generate_service_account_key_fn(
     - max_parallel_requests: Optional[int] - Rate limit a user based on the number of parallel requests. Raises 429 error, if user's parallel requests > x.
     - metadata: Optional[dict] - Metadata for key, store information for key. Example metadata = {"team": "core-infra", "app": "app2", "email": "ishaan@berri.ai" }
     - guardrails: Optional[List[str]] - List of active guardrails for the key
-    - permissions: Optional[dict] - key-specific permissions. Proxy-admin-only field; non-admin callers must leave this empty. Example - {"allow_pii_controls": true}
+    - permissions: Optional[dict] - key-specific permissions. Proxy-admin-only field; non-admin callers must leave this empty. Example - {"get_spend_routes": true}
     - model_max_budget: Optional[Dict[str, BudgetConfig]] - Model-specific budgets {"gpt-4": {"budget_limit": 0.0005, "time_period": "30d"}}}. IF null or {} then no model specific budget.
     - model_rpm_limit: Optional[dict] - key-specific model rpm limit. Example - {"text-davinci-002": 1000, "gpt-3.5-turbo": 1000}. IF null or {} then no model specific rpm limit.
     - model_tpm_limit: Optional[dict] - key-specific model tpm limit. Example - {"text-davinci-002": 1000, "gpt-3.5-turbo": 1000}. IF null or {} then no model specific tpm limit.
@@ -1682,7 +1682,7 @@ async def generate_service_account_key_fn(
         --header 'Authorization: Bearer sk-1234' \
         --header 'Content-Type: application/json' \
         --data '{
-            "permissions": {"allow_pii_controls": true}
+            "permissions": {"get_spend_routes": true}
     }'
     ```
 
