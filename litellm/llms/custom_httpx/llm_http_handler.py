@@ -1,13 +1,14 @@
+import asyncio
 import json
 import ssl
 from functools import lru_cache
-from urllib.parse import parse_qs, urlencode, urlparse, urlunparse
 from typing import (
     TYPE_CHECKING,
     Any,
     AsyncIterator,
     Coroutine,
     Dict,
+    Iterator,
     List,
     Literal,
     Optional,
@@ -16,6 +17,7 @@ from typing import (
     cast,
     get_type_hints,
 )
+from urllib.parse import parse_qs, urlencode, urlparse, urlunparse
 
 import httpx  # type: ignore
 from openai.types.file_deleted import FileDeleted
@@ -27,8 +29,8 @@ import litellm.types.utils
 from litellm._logging import _redact_string, verbose_logger
 from litellm.anthropic_beta_headers_manager import update_headers_with_filtered_beta
 from litellm.constants import REALTIME_WEBSOCKET_MAX_MESSAGE_SIZE_BYTES
-from litellm.litellm_core_utils.realtime_streaming import RealTimeStreaming
 from litellm.litellm_core_utils.asyncify import run_async_function
+from litellm.litellm_core_utils.realtime_streaming import RealTimeStreaming
 from litellm.litellm_core_utils.url_utils import encode_url_path_segment
 from litellm.llms.base_llm.anthropic_messages.transformation import (
     BaseAnthropicMessagesConfig,
@@ -107,6 +109,7 @@ from litellm.types.llms.openai import (
     ResponsesAPIOptionalRequestParams,
     ResponsesAPIResponse,
 )
+from litellm.types.realtime import RealtimeQueryParams
 from litellm.types.rerank import RerankResponse
 from litellm.types.responses.main import DeleteResponseResult
 from litellm.types.router import GenericLiteLLMParams
@@ -132,7 +135,6 @@ from litellm.types.vector_stores import (
     VectorStoreSearchOptionalRequestParams,
     VectorStoreSearchResponse,
 )
-from litellm.types.realtime import RealtimeQueryParams
 from litellm.types.videos.main import VideoObject
 from litellm.utils import (
     CustomStreamWrapper,
@@ -2231,7 +2233,11 @@ class BaseLLMHTTPHandler:
             kwargs=kwargs,
         )
 
-        return final_response if final_response is not None else initial_response
+        return self._maybe_wrap_in_fake_stream(
+            final_response if final_response is not None else initial_response,
+            logging_obj,
+            "anthropic_messages",
+        )
 
     def anthropic_messages_handler(
         self,
@@ -3438,6 +3444,23 @@ class BaseLLMHTTPHandler:
                 data=presigned_request["data"],
                 timeout=timeout,
             )
+        elif (
+            isinstance(transformed_request, dict)
+            and "resumable_chunked_upload" in transformed_request
+        ):
+            try:
+                upload_response = self._resumable_chunked_upload(
+                    client=sync_httpx_client,
+                    initiate_url=api_base,
+                    base_headers=headers,
+                    config=cast(Dict[str, Any], transformed_request)[
+                        "resumable_chunked_upload"
+                    ],
+                    timeout=timeout,
+                )
+            except Exception as e:
+                verbose_logger.exception(f"Error creating file: {e}")
+                raise self._handle_error(e=e, provider_config=provider_config)
         elif isinstance(transformed_request, str) or isinstance(
             transformed_request, bytes
         ):
@@ -3519,7 +3542,15 @@ class BaseLLMHTTPHandler:
             input="",
             api_key="",
             additional_args={
-                "complete_input_dict": transformed_request,
+                # A resumable upload config holds a reference to the (potentially
+                # huge) upload payload; logging deep-copies additional_args, so log
+                # a placeholder instead of re-materializing the payload.
+                "complete_input_dict": (
+                    "<resumable chunked upload>"
+                    if isinstance(transformed_request, dict)
+                    and "resumable_chunked_upload" in transformed_request
+                    else transformed_request
+                ),
                 "api_base": api_base,
                 "headers": headers,
             },
@@ -3596,6 +3627,23 @@ class BaseLLMHTTPHandler:
                 data=presigned_request["data"],
                 timeout=timeout,
             )
+        elif (
+            isinstance(transformed_request, dict)
+            and "resumable_chunked_upload" in transformed_request
+        ):
+            try:
+                upload_response = await self._aresumable_chunked_upload(
+                    client=async_httpx_client,
+                    initiate_url=api_base,
+                    base_headers=headers,
+                    config=cast(Dict[str, Any], transformed_request)[
+                        "resumable_chunked_upload"
+                    ],
+                    timeout=timeout,
+                )
+            except Exception as e:
+                verbose_logger.exception(f"Error creating file: {e}")
+                raise self._handle_error(e=e, provider_config=provider_config)
         elif isinstance(transformed_request, str) or isinstance(
             transformed_request, bytes
         ):
@@ -3638,6 +3686,224 @@ class BaseLLMHTTPHandler:
             logging_obj=logging_obj,
             litellm_params=litellm_params,
         )
+
+    # 8 MiB; a 256 KiB multiple, which GCS requires for every non-final chunk.
+    _RESUMABLE_CHUNK_SIZE = 8 * 1024 * 1024
+
+    @staticmethod
+    def _iter_resumable_chunks(
+        byte_iter: Iterator[bytes], chunk_size: int
+    ) -> Iterator[bytes]:
+        """Regroup a byte stream into ``chunk_size`` pieces, yielding a final
+        partial piece only when it is non-empty. Every full piece is exactly
+        ``chunk_size`` bytes (kept a 256 KiB multiple for GCS) and never more than
+        one chunk is buffered. An exactly chunk-aligned stream yields only full
+        chunks, so the upload finalizes on its last data chunk instead of making
+        an extra empty request; a 0-byte stream yields nothing and the caller
+        finalizes with a single empty request.
+        """
+        buf = bytearray()
+        for piece in byte_iter:
+            buf.extend(piece)
+            while len(buf) >= chunk_size:
+                yield bytes(buf[:chunk_size])
+                del buf[:chunk_size]
+        if buf:
+            yield bytes(buf)
+
+    @staticmethod
+    def _resumable_content_range(offset: int, data_len: int, is_final: bool) -> str:
+        if not is_final:
+            return f"bytes {offset}-{offset + data_len - 1}/*"
+        total = offset + data_len
+        if data_len == 0:
+            return f"bytes */{total}"
+        return f"bytes {offset}-{total - 1}/{total}"
+
+    @staticmethod
+    def _resumable_request_kwargs(
+        headers: dict,
+        content: bytes,
+        timeout: Optional[Union[float, httpx.Timeout]],
+    ) -> dict:
+        kwargs: Dict[str, Any] = {"headers": headers, "content": content}
+        if timeout is not None:
+            kwargs["timeout"] = timeout
+        return kwargs
+
+    def _resumable_chunked_upload(
+        self,
+        *,
+        client: HTTPHandler,
+        initiate_url: str,
+        base_headers: dict,
+        config: dict,
+        timeout: Optional[Union[float, httpx.Timeout]],
+    ) -> httpx.Response:
+        """Open a GCS resumable session, then PUT the body in bounded chunks so a
+        large upload is never held in memory in full."""
+        stream = config["body_stream"]
+        chunk_size = config.get("chunk_size", self._RESUMABLE_CHUNK_SIZE)
+        session_url_header = config.get("session_url_header", "location")
+        httpx_client = client.client
+
+        init_headers = {**base_headers, **config.get("initiate_headers", {})}
+        init_req = httpx_client.build_request(
+            "POST",
+            initiate_url,
+            **self._resumable_request_kwargs(init_headers, b"", timeout),
+        )
+        init_resp = httpx_client.send(init_req, follow_redirects=False)
+        init_resp.read()
+        if init_resp.status_code not in (200, 201):
+            init_resp.raise_for_status()
+        session_url = init_resp.headers.get(session_url_header)
+        if not session_url:
+            raise ValueError(
+                f"resumable upload: no session URL in '{session_url_header}' header"
+            )
+
+        offset = 0
+        pending: Optional[bytes] = None
+        for chunk in self._iter_resumable_chunks(stream.iter_bytes(), chunk_size):
+            if pending is not None:
+                self._send_resumable_chunk(
+                    httpx_client,
+                    session_url,
+                    base_headers,
+                    pending,
+                    offset,
+                    is_final=False,
+                    timeout=timeout,
+                )
+                offset += len(pending)
+            pending = chunk
+        return self._send_resumable_chunk(
+            httpx_client,
+            session_url,
+            base_headers,
+            pending or b"",
+            offset,
+            is_final=True,
+            timeout=timeout,
+        )
+
+    def _send_resumable_chunk(
+        self,
+        httpx_client: httpx.Client,
+        url: str,
+        base_headers: dict,
+        data: bytes,
+        offset: int,
+        *,
+        is_final: bool,
+        timeout: Optional[Union[float, httpx.Timeout]],
+    ) -> httpx.Response:
+        headers = {
+            **base_headers,
+            "Content-Range": self._resumable_content_range(offset, len(data), is_final),
+        }
+        req = httpx_client.build_request(
+            "PUT", url, **self._resumable_request_kwargs(headers, data, timeout)
+        )
+        resp = httpx_client.send(req, follow_redirects=False)
+        resp.read()
+        if resp.status_code not in ((200, 201) if is_final else (308,)):
+            # 4xx/5xx raise here; the ValueError catches an unexpected success
+            # status (e.g. a 200 where the protocol expects a 308 between chunks).
+            resp.raise_for_status()
+            raise ValueError(f"resumable upload: unexpected status {resp.status_code}")
+        return resp
+
+    async def _aresumable_chunked_upload(
+        self,
+        *,
+        client: AsyncHTTPHandler,
+        initiate_url: str,
+        base_headers: dict,
+        config: dict,
+        timeout: Optional[Union[float, httpx.Timeout]],
+    ) -> httpx.Response:
+        stream = config["body_stream"]
+        chunk_size = config.get("chunk_size", self._RESUMABLE_CHUNK_SIZE)
+        session_url_header = config.get("session_url_header", "location")
+        httpx_client = client.client
+
+        init_headers = {**base_headers, **config.get("initiate_headers", {})}
+        init_req = httpx_client.build_request(
+            "POST",
+            initiate_url,
+            **self._resumable_request_kwargs(init_headers, b"", timeout),
+        )
+        init_resp = await httpx_client.send(init_req, follow_redirects=False)
+        await init_resp.aread()
+        if init_resp.status_code not in (200, 201):
+            init_resp.raise_for_status()
+        session_url = init_resp.headers.get(session_url_header)
+        if not session_url:
+            raise ValueError(
+                f"resumable upload: no session URL in '{session_url_header}' header"
+            )
+
+        offset = 0
+        pending: Optional[bytes] = None
+        # Producing each chunk runs the synchronous per-row transform for that
+        # chunk's worth of rows. Pull it off the event loop thread so a large
+        # upload does not block other concurrent requests between PUTs.
+        chunk_iter = self._iter_resumable_chunks(stream.iter_bytes(), chunk_size)
+        done = object()
+        while True:
+            chunk = await asyncio.to_thread(next, chunk_iter, done)
+            if chunk is done:
+                break
+            if pending is not None:
+                await self._asend_resumable_chunk(
+                    httpx_client,
+                    session_url,
+                    base_headers,
+                    pending,
+                    offset,
+                    is_final=False,
+                    timeout=timeout,
+                )
+                offset += len(pending)
+            pending = chunk
+        return await self._asend_resumable_chunk(
+            httpx_client,
+            session_url,
+            base_headers,
+            pending or b"",
+            offset,
+            is_final=True,
+            timeout=timeout,
+        )
+
+    async def _asend_resumable_chunk(
+        self,
+        httpx_client: httpx.AsyncClient,
+        url: str,
+        base_headers: dict,
+        data: bytes,
+        offset: int,
+        *,
+        is_final: bool,
+        timeout: Optional[Union[float, httpx.Timeout]],
+    ) -> httpx.Response:
+        headers = {
+            **base_headers,
+            "Content-Range": self._resumable_content_range(offset, len(data), is_final),
+        }
+        req = httpx_client.build_request(
+            "PUT", url, **self._resumable_request_kwargs(headers, data, timeout)
+        )
+        resp = await httpx_client.send(req, follow_redirects=False)
+        await resp.aread()
+        if resp.status_code not in ((200, 201) if is_final else (308,)):
+            # 4xx/5xx raise here; the ValueError catches an unexpected success
+            # status (e.g. a 200 where the protocol expects a 308 between chunks).
+            resp.raise_for_status()
+            raise ValueError(f"resumable upload: unexpected status {resp.status_code}")
+        return resp
 
     def create_batch(
         self,
@@ -5242,6 +5508,50 @@ class BaseLLMHTTPHandler:
             **kwargs_for_followup,
         )
 
+    def _maybe_wrap_in_fake_stream(
+        self,
+        response: Any,
+        logging_obj: Optional["LiteLLMLoggingObj"],
+        api_surface: str,
+    ) -> Any:
+        """
+        If the original request was streaming but converted to non-streaming for
+        WebSearch interception, wrap the dict response in a FakeAnthropicMessagesStreamIterator.
+
+        The converted-stream flag is only ever set by anthropic-messages websearch
+        interception, and the wrapper rebuilds an Anthropic SSE stream, so wrapping
+        is gated on ``api_surface == "anthropic_messages"`` to leave other surfaces
+        (e.g. the responses API) untouched.
+        """
+        if api_surface != "anthropic_messages":
+            return response
+        websearch_converted_stream = (
+            logging_obj.model_call_details.get(
+                "websearch_interception_converted_stream", False
+            )
+            if logging_obj is not None
+            else False
+        )
+        if websearch_converted_stream and isinstance(response, dict):
+            from typing import cast
+
+            from litellm._logging import verbose_logger
+            from litellm.llms.anthropic.experimental_pass_through.messages.fake_stream_iterator import (
+                FakeAnthropicMessagesStreamIterator,
+            )
+            from litellm.types.llms.anthropic_messages.anthropic_response import (
+                AnthropicMessagesResponse,
+            )
+
+            verbose_logger.debug(
+                "WebSearchInterception: Agentic loop completed, "
+                "converting non-streaming response to fake stream"
+            )
+            return FakeAnthropicMessagesStreamIterator(
+                response=cast(AnthropicMessagesResponse, response)
+            )
+        return response
+
     async def _call_agentic_completion_hooks(
         self,
         response: Any,
@@ -5324,7 +5634,7 @@ class BaseLLMHTTPHandler:
                     is not CustomLogger.async_build_agentic_loop_plan
                 )
                 if not build_plan_overridden:
-                    return await callback.async_run_agentic_loop(
+                    agentic_result = await callback.async_run_agentic_loop(
                         tools=tool_calls,
                         model=model,
                         messages=messages,
@@ -5334,6 +5644,9 @@ class BaseLLMHTTPHandler:
                         logging_obj=logging_obj,
                         stream=stream,
                         kwargs=kwargs_with_provider,
+                    )
+                    return self._maybe_wrap_in_fake_stream(
+                        agentic_result, logging_obj, api_surface
                     )
 
                 plan = await callback.async_build_agentic_loop_plan(
@@ -5349,14 +5662,18 @@ class BaseLLMHTTPHandler:
                 )
 
                 if plan.response_override is not None:
-                    return plan.response_override
+                    return self._maybe_wrap_in_fake_stream(
+                        plan.response_override, logging_obj, api_surface
+                    )
                 if plan.terminate:
                     verbose_logger.debug(
                         "Agentic loop terminated by callback=%s reason=%s",
                         callback.__class__.__name__,
                         plan.stop_reason,
                     )
-                    return response
+                    return self._maybe_wrap_in_fake_stream(
+                        response, logging_obj, api_surface
+                    )
                 if not plan.run_agentic_loop:
                     continue
 
@@ -5374,19 +5691,23 @@ class BaseLLMHTTPHandler:
                         callback=callback,
                     )
 
-                return await self._execute_anthropic_agentic_plan(
-                    plan=plan,
-                    model=model,
-                    messages=messages,
-                    anthropic_messages_optional_request_params=anthropic_messages_optional_request_params,
-                    logging_obj=logging_obj,
-                    kwargs=kwargs_with_provider,
-                    depth=depth,
-                    max_loops=max_loops,
-                    fingerprints=fingerprints,
-                    fingerprint=fingerprint,
-                    stream=stream,
-                    callback=callback,
+                return self._maybe_wrap_in_fake_stream(
+                    await self._execute_anthropic_agentic_plan(
+                        plan=plan,
+                        model=model,
+                        messages=messages,
+                        anthropic_messages_optional_request_params=anthropic_messages_optional_request_params,
+                        logging_obj=logging_obj,
+                        kwargs=kwargs_with_provider,
+                        depth=depth,
+                        max_loops=max_loops,
+                        fingerprints=fingerprints,
+                        fingerprint=fingerprint,
+                        stream=stream,
+                        callback=callback,
+                    ),
+                    logging_obj,
+                    api_surface,
                 )
             except Exception as e:
                 _call_id = getattr(logging_obj, "litellm_call_id", "unknown")
@@ -5403,37 +5724,9 @@ class BaseLLMHTTPHandler:
         # 1. Stream was originally True but converted to False for WebSearch interception
         # 2. No agentic loop ran (LLM didn't use the tool)
         # 3. We have a non-streaming response that needs to be converted to streaming
-        websearch_converted_stream = (
-            logging_obj.model_call_details.get(
-                "websearch_interception_converted_stream", False
-            )
-            if logging_obj is not None
-            else False
-        )
-
-        if api_surface == "anthropic_messages" and websearch_converted_stream:
-            from typing import cast
-
-            from litellm._logging import verbose_logger
-            from litellm.llms.anthropic.experimental_pass_through.messages.fake_stream_iterator import (
-                FakeAnthropicMessagesStreamIterator,
-            )
-            from litellm.types.llms.anthropic_messages.anthropic_response import (
-                AnthropicMessagesResponse,
-            )
-
-            verbose_logger.debug(
-                "WebSearchInterception: No tool call made, converting non-streaming response to fake stream"
-            )
-
-            # Convert the non-streaming response to a fake stream
-            # The response should be an AnthropicMessagesResponse (dict)
-            if isinstance(response, dict):
-                # Create a fake streaming iterator
-                fake_stream = FakeAnthropicMessagesStreamIterator(
-                    response=cast(AnthropicMessagesResponse, response)
-                )
-                return fake_stream
+        result = self._maybe_wrap_in_fake_stream(response, logging_obj, api_surface)
+        if result is not response:
+            return result
 
         return None
 
