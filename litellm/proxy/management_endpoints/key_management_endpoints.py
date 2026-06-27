@@ -589,23 +589,23 @@ def _check_budget_limits_delegation_ceiling(
     """
     if not budget_limits:
         return
-    if user_api_key_dict.user_role == LitellmUserRoles.PROXY_ADMIN.value:
-        return
-    if is_ui_session_team_key:
-        return
-    over_ceiling = next(
+    non_finite = next(
         (w for w in budget_limits if not math.isfinite(w.max_budget)), None
     )
-    if over_ceiling is not None:
+    if non_finite is not None:
         raise HTTPException(
             status_code=400,
             detail={
                 "error": (
-                    f"budget_limits entry max_budget ({over_ceiling.max_budget}) "
+                    f"budget_limits entry max_budget ({non_finite.max_budget}) "
                     "must be a finite number."
                 )
             },
         )
+    if user_api_key_dict.user_role == LitellmUserRoles.PROXY_ADMIN.value:
+        return
+    if is_ui_session_team_key:
+        return
     if user_api_key_dict.is_session_token and team_table is None:
         raise HTTPException(
             status_code=400,

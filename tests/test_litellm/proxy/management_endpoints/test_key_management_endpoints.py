@@ -12722,7 +12722,7 @@ async def test_cli_session_token_personal_key_without_budget_allowed():
 @pytest.mark.asyncio
 async def test_budget_limits_window_cannot_exceed_caller_max_budget(monkeypatch):
     """
-    LIT-4072 regression: the delegation ceiling on /key/generate must apply
+    VERIA-392 regression: the delegation ceiling on /key/generate must apply
     to every per-window entry in budget_limits, not just the all-time
     max_budget. Otherwise a non-admin with max_budget=$10 can mint a key
     whose 1-day window is $1,000,000.
@@ -12817,7 +12817,7 @@ async def test_budget_limits_admin_unrestricted(monkeypatch):
 @pytest.mark.asyncio
 async def test_permissions_field_rejected_for_non_admin(monkeypatch):
     """
-    LIT-4072 regression: `permissions` grants ambient capabilities
+    VERIA-392 regression: `permissions` grants ambient capabilities
     (`get_spend_routes`, etc.) and must follow the same admin gate as
     `allowed_routes`. A non-admin caller submitting a non-empty
     permissions dict gets a 403.
@@ -12904,7 +12904,7 @@ async def test_permissions_admin_can_set_any(monkeypatch):
 @pytest.mark.asyncio
 async def test_budget_limits_session_token_personal_key_blocked(monkeypatch):
     """
-    LIT-4072 regression: a CLI session token (max_budget=None) writing
+    VERIA-392 B1: a CLI session token (max_budget=None) writing
     budget_limits to a personal key has zero delegation authority. The
     symmetric guard already exists for the scalar max_budget; budget_limits
     must follow the same rule, before any delegation_ceiling early-return.
@@ -12936,8 +12936,8 @@ async def test_budget_limits_session_token_personal_key_blocked(monkeypatch):
 @pytest.mark.asyncio
 async def test_budget_limits_window_equal_to_ceiling_allowed(monkeypatch):
     """
-    LIT-4072 boundary: a window exactly equal to the caller's ceiling is
-    permitted. Pins the strict `>` semantics so a future refactor to `>=`
+    VERIA-392 m2 boundary: a window exactly equal to the caller's ceiling
+    is permitted. Pins the strict `>` semantics so a future refactor to `>=`
     is caught by tests.
     """
     monkeypatch.setattr(
@@ -12970,8 +12970,8 @@ async def test_budget_limits_window_equal_to_ceiling_allowed(monkeypatch):
 @pytest.mark.asyncio
 async def test_budget_limits_nan_window_rejected(monkeypatch):
     """
-    LIT-4072 regression: a NaN window max_budget bypasses the `>` ceiling
-    check (NaN > x is False) and disables downstream budget enforcement
+    VERIA-392 M1: a NaN window max_budget bypasses the `>` ceiling check
+    (NaN > x is False) and disables downstream budget enforcement
     (spend > NaN is always False). math.isfinite must reject it before the
     ceiling comparison runs.
     """
@@ -13000,13 +13000,43 @@ async def test_budget_limits_nan_window_rejected(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_budget_limits_nan_window_rejected_for_admin(monkeypatch):
+    """
+    LIT-4072 follow-up: the math.isfinite check must run before the
+    admin / UI-session carve-outs. A fat-fingered admin payload with NaN
+    would otherwise silently disable downstream budget comparisons
+    (spend > NaN is always False).
+    """
+    monkeypatch.setattr(
+        "litellm.proxy.management_endpoints.key_management_endpoints.litellm.default_key_generate_params",
+        None,
+        raising=False,
+    )
+    admin = UserAPIKeyAuth(
+        user_role=LitellmUserRoles.PROXY_ADMIN,
+        user_id="admin-1",
+    )
+    request = GenerateKeyRequest(
+        budget_limits=[{"budget_duration": "1d", "max_budget": float("nan")}],
+    )
+    with pytest.raises(HTTPException) as exc_info:
+        await _common_key_generation_helper(
+            data=request,
+            user_api_key_dict=admin,
+            litellm_changed_by=None,
+            team_table=None,
+        )
+    assert exc_info.value.status_code == 400
+    assert "finite" in str(exc_info.value.detail)
+
+
+@pytest.mark.asyncio
 async def test_update_key_non_admin_permissions_rejected(monkeypatch):
     """
-    LIT-4072 regression: /key/update did not gate the permissions dict. A
-    non-admin key owner could silently flip allow_pii_controls /
-    custom_admin / etc. on their own key because permissions is not a
-    budget field, so the can_skip_admin_check fast path applied. Now
-    mirrors /key/generate.
+    VERIA-392 B2: /key/update did not gate the permissions dict. A non-admin
+    key owner could silently flip allow_pii_controls / custom_admin / etc.
+    on their own key because permissions is not a budget field, so the
+    can_skip_admin_check fast path applied. Now mirrors /key/generate.
     """
     from litellm.proxy._types import LiteLLM_VerificationToken
     from litellm.proxy.management_endpoints.key_management_endpoints import (
@@ -13049,10 +13079,9 @@ async def test_update_key_non_admin_permissions_rejected(monkeypatch):
 @pytest.mark.asyncio
 async def test_regenerate_key_non_admin_permissions_rejected():
     """
-    LIT-4072 regression: /key/regenerate inherited the same hole as
-    /key/generate and /key/update. The handler now invokes
-    _check_permissions_caller_permission on the request body before any
-    DB lookup.
+    VERIA-392 B2: /key/regenerate inherited the same hole as /key/generate
+    and /key/update. The handler now invokes _check_permissions_caller_permission
+    on the request body before any DB lookup.
     """
     from litellm.proxy.management_endpoints.key_management_endpoints import (
         _check_permissions_caller_permission,
@@ -13073,10 +13102,9 @@ async def test_regenerate_key_non_admin_permissions_rejected():
 @pytest.mark.asyncio
 async def test_regenerate_key_non_admin_budget_limits_rejected():
     """
-    LIT-4072 regression: /key/regenerate's body carries budget_limits.
-    The handler now applies _check_budget_limits_delegation_ceiling so
-    a non-admin owner of a $10 key cannot regenerate it into a $1M/day
-    key.
+    VERIA-392 B2: /key/regenerate's body carries budget_limits. The
+    handler now applies _check_budget_limits_delegation_ceiling so a
+    non-admin owner of a $10 key cannot regenerate it into a $1M/day key.
     """
     from litellm.proxy.management_endpoints.key_management_endpoints import (
         _check_budget_limits_delegation_ceiling,
