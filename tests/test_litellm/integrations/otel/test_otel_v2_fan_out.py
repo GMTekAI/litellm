@@ -35,8 +35,10 @@ from litellm.integrations.otel.plumbing.context import (  # noqa: E402
 )
 from litellm.integrations.otel.plumbing.fan_out import (  # noqa: E402
     TenantFanOutSpanProcessor,
-    _destination_resource_attrs,
     _processor_key,
+)
+from litellm.integrations.otel.plumbing.providers import (  # noqa: E402
+    destination_resource_attrs,
 )
 from litellm.integrations.otel.plumbing import providers  # noqa: E402
 from litellm.integrations.otel.model.config import OpenTelemetryV2Config  # noqa: E402
@@ -154,7 +156,7 @@ def test_arize_fan_out_uses_destination_project_over_env(monkeypatch):
         },
     )
 
-    assert _destination_resource_attrs(destination) == {
+    assert destination_resource_attrs(destination) == {
         "model_id": "tenant-project",
         "arize.project.name": "tenant-project",
     }

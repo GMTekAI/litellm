@@ -21,8 +21,6 @@ from __future__ import annotations
 from collections import OrderedDict
 from typing import TYPE_CHECKING
 
-import os
-
 from opentelemetry.context import Context
 from opentelemetry.sdk.resources import Resource
 from opentelemetry.sdk.trace import ReadableSpan, Span, SpanProcessor
@@ -168,26 +166,17 @@ def _is_genai_span(span: ReadableSpan) -> bool:
     return _GENAI_SPAN_ATTR in attributes
 
 
-# Backend-specific Resource attributes required by the destination. Arize
-# rejects spans missing ``model_id`` (or the alternative ``arize.project.name``
-# span attribute); other backends accept the proxy's default Resource.
-def _destination_resource_attrs(destination: OtelDestination) -> dict[str, str]:
-    if destination.resource_attributes:
-        return dict(destination.resource_attributes)
-    if destination.callback_name == "arize":
-        project = os.environ.get("ARIZE_PROJECT_NAME")
-        if project:
-            return {"model_id": project, "arize.project.name": project}
-    return {}
-
-
 def _with_destination_resource(
     span: ReadableSpan, destination: OtelDestination
 ) -> ReadableSpan:
     """Return ``span`` with its Resource augmented by the destination's required
     attributes. The original span object is left untouched; a shallow wrapper
     reuses every other field and only swaps the ``resource`` property."""
-    extra = _destination_resource_attrs(destination)
+    from litellm.integrations.otel.plumbing.providers import (
+        destination_resource_attrs,
+    )
+
+    extra = destination_resource_attrs(destination)
     if not extra:
         return span
     merged = Resource.create({**dict(span.resource.attributes), **extra})

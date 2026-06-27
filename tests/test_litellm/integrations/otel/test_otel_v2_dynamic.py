@@ -191,6 +191,94 @@ def test_fan_out_to_many_destinations_is_one_provider_with_all_exporters():
     assert len(cache._providers) == 1
 
 
+# --- gen-AI span Resource must match its fanned-out parents ----------------- #
+#
+# The gen-AI LLM-call span is emitted through the TenantTracerCache clone
+# provider, while the proxy-internal spans (server/auth/db) are forwarded by
+# TenantFanOutSpanProcessor, which wraps each with the destination's backend-
+# required Resource attrs (Arize needs model_id / arize.project.name). If the
+# clone provider does NOT also carry those attrs, the gen-AI span reaches Arize
+# with only service.name and Arize renders it as an orphaned subtree. These pin
+# that the clone Resource carries the same attrs the fan-out wrap injects.
+
+
+def _dest_with_resource(endpoint, backend, resource_attributes):
+    return OtelDestination(
+        endpoint=endpoint,
+        headers={"Authorization": "Basic AAAA"},
+        callback_name=backend,
+        resource_attributes=resource_attributes,
+    )
+
+
+def test_clone_config_carries_destination_resource_attrs():
+    cache = _cache("arize")
+    new = cache._config_with_destinations(
+        (
+            _dest_with_resource(
+                "https://otlp.arize.com/v1",
+                "arize",
+                {"model_id": "team-b-proj", "arize.project.name": "team-b-proj"},
+            ),
+        )
+    )
+    assert new.resource_attributes["model_id"] == "team-b-proj"
+    assert new.resource_attributes["arize.project.name"] == "team-b-proj"
+
+
+def test_clone_config_uses_arize_env_fallback(monkeypatch):
+    """A destination with no explicit resource_attributes but the arize backend
+    falls back to ARIZE_PROJECT_NAME -- the SAME fallback the fan-out path uses,
+    so the gen-AI span and its parents still agree on the Resource."""
+    monkeypatch.setenv("ARIZE_PROJECT_NAME", "env-proj")
+    cache = _cache("arize")
+    new = cache._config_with_destinations(
+        (_dest("https://otlp.arize.com/v1", backend="arize"),)
+    )
+    assert new.resource_attributes["model_id"] == "env-proj"
+    assert new.resource_attributes["arize.project.name"] == "env-proj"
+
+
+def test_clone_provider_emits_genai_span_with_destination_resource():
+    """End-to-end regression: the span the clone provider actually exports must
+    carry the destination's Resource attrs. Pre-fix this Resource was
+    service.name only, orphaning the gen-AI span in Arize."""
+    from opentelemetry.sdk.trace.export.in_memory_span_exporter import (
+        InMemorySpanExporter,
+    )
+
+    from litellm.integrations.otel.plumbing.providers import (
+        build_tracer_provider,
+        get_tracer,
+    )
+
+    cfg = OpenTelemetryV2Config(
+        service_name="litellm-proxy",
+        exporters=[ExporterSpec(kind="in_memory", owner="arize")],
+    )
+    cache = TenantTracerCache(cfg, "arize", "litellm")
+    dest = _dest_with_resource(
+        "https://otlp.arize.com/v1",
+        "arize",
+        {"model_id": "team-b-proj", "arize.project.name": "team-b-proj"},
+    )
+    tracer = cache.tracer_for(get_tracer(build_tracer_provider(cfg)), (dest,))
+    with tracer.start_as_current_span("chat anthropic-haiku") as span:
+        span.set_attribute("gen_ai.operation.name", "chat")
+
+    provider = next(iter(cache._providers.values()))
+    provider.force_flush()
+    captured = []
+    for proc in provider._active_span_processor._span_processors:
+        exporter = getattr(proc, "span_exporter", None)
+        if isinstance(exporter, InMemorySpanExporter):
+            captured = exporter.get_finished_spans()
+    assert captured, "clone provider exported no span to its in-memory exporter"
+    resource_attrs = dict(captured[0].resource.attributes)
+    assert resource_attrs.get("model_id") == "team-b-proj"
+    assert resource_attrs.get("arize.project.name") == "team-b-proj"
+
+
 # --- security: request credentials never route a trace --------------------- #
 
 

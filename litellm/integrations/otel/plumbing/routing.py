@@ -124,7 +124,18 @@ class TenantTracerCache:
         ``TracerProvider`` attaches one ``SpanProcessor`` per spec, so a single span
         is emitted once and exported to the global destination plus every assigned
         one. Each appended exporter's endpoint is the resolved host (the cross-host
-        fix) with its own auth headers (per-destination isolation)."""
+        fix) with its own auth headers (per-destination isolation).
+
+        The clone's Resource also folds in the destinations' backend-required
+        Resource attributes (Arize needs ``model_id`` / ``arize.project.name``), via
+        the same ``destination_resource_attrs`` the fan-out path uses on proxy-
+        internal spans. Without this the gen-AI span emitted through the clone
+        reaches Arize with only ``service.name`` while its parents (fan-out) carry
+        ``model_id``, and Arize splits the trace into an orphaned subtree."""
+        from litellm.integrations.otel.plumbing.providers import (
+            destination_resource_attrs,
+        )
+
         kind = self._owned_otlp_kind()
         appended = [
             ExporterSpec(
@@ -135,6 +146,17 @@ class TenantTracerCache:
             )
             for d in destinations
         ]
+        merged_resource_attrs = {
+            **self._config.resource_attributes,
+            **{
+                key: value
+                for d in destinations
+                for key, value in destination_resource_attrs(d).items()
+            },
+        }
         return self._config.model_copy(
-            update={"exporters": [*self._config.exporters, *appended]}
+            update={
+                "exporters": [*self._config.exporters, *appended],
+                "resource_attributes": merged_resource_attrs,
+            }
         )

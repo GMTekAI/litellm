@@ -1,5 +1,6 @@
 """Provider / exporter factory + the Baggage span processor."""
 
+import os
 from typing import TYPE_CHECKING, Any, Callable, Iterable
 
 from opentelemetry import baggage, metrics
@@ -30,6 +31,8 @@ from litellm.integrations.otel.model.utils import parse_headers as parse_headers
 if TYPE_CHECKING:
     from opentelemetry.metrics import Meter
     from opentelemetry.sdk.metrics.export import MetricReader
+
+    from litellm.integrations.otel.model.destination import OtelDestination
 
 _SPAN_KIND_BY_ROLE_KIND: dict[LiteLLMSpanKind, SpanKind] = {
     LiteLLMSpanKind.SERVER: SpanKind.SERVER,
@@ -122,6 +125,26 @@ _GRPC_BACKENDS = frozenset({"arize"})
 def default_otlp_kind_for_backend(callback_name: "str | None") -> str:
     """The intrinsic OTLP transport for a backend's own OTLP endpoint."""
     return "otlp_grpc" if callback_name in _GRPC_BACKENDS else "otlp_http"
+
+
+def destination_resource_attrs(destination: "OtelDestination") -> dict[str, str]:
+    """Backend-specific Resource attributes a destination requires on every span.
+
+    Arize rejects spans whose Resource is missing ``model_id`` (or the alternative
+    ``arize.project.name`` span attribute), so the proxy's default ``service.name``
+    Resource is not enough. Single source of truth shared by the two export paths
+    that reach a per-tenant destination -- the ``TenantFanOutSpanProcessor`` (proxy-
+    internal spans) and the ``TenantTracerCache`` clone provider (the gen-AI span) --
+    so the gen-AI span and its parents always carry the SAME Resource and a backend
+    like Arize renders one connected trace instead of an orphaned subtree.
+    """
+    if destination.resource_attributes:
+        return dict(destination.resource_attributes)
+    if destination.callback_name == "arize":
+        project = os.environ.get("ARIZE_PROJECT_NAME")
+        if project:
+            return {"model_id": project, "arize.project.name": project}
+    return {}
 
 
 def _exporter_from_spec(spec: ExporterSpec) -> SpanExporter:
