@@ -550,18 +550,35 @@ def _check_allowed_routes_caller_permission(
 def _check_permissions_caller_permission(
     permissions: Optional[PermissionsDict],
     user_api_key_dict: UserAPIKeyAuth,
+    *,
+    field_was_set: Optional[bool] = None,
 ) -> None:
     """
-    Only proxy admins may set the `permissions` dict on a key.
+    Only proxy admins may write the `permissions` dict on a key.
 
     The field grants ambient capabilities (e.g. `get_spend_routes` exposes
     `/global/spend/*`), so it must follow the same admin gate as
     `allowed_routes`. Without this gate a non-admin can self-grant capabilities
     they do not hold, including read access to global spend.
+
+    `field_was_set` distinguishes the create vs update semantic:
+    - Create (`/key/generate` family): pass None. Non-admins are rejected only
+      when they submit a non-empty dict; the empty `{}` default is the
+      legitimate non-admin shape.
+    - Update (`/key/update`, `/key/regenerate`, bulk paths): pass
+      `"permissions" in data.model_fields_set`. An explicit empty `{}` or
+      `null` from a non-admin is also rejected, because that *clears* an
+      admin-set capability such as `enable_llm_guard_check` and is itself a
+      privilege escalation.
     """
-    if not permissions:
-        return
     if user_api_key_dict.user_role == LitellmUserRoles.PROXY_ADMIN.value:
+        return
+    if field_was_set is True:
+        raise HTTPException(
+            status_code=403,
+            detail={"error": "Only proxy admins can write `permissions` on a key."},
+        )
+    if not permissions:
         return
     raise HTTPException(
         status_code=403,
@@ -2051,6 +2068,17 @@ async def _process_single_key_update(
             user_api_key_cache=user_api_key_cache,
         )
 
+    # Bulk update entry point: /key/bulk_update and /team/key/bulk_update
+    # construct UpdateKeyRequest objects and call this helper directly, so
+    # the per-key /key/update gate in _validate_update_key_data does not run.
+    # The same admin gate must apply here, and on the explicit-clear shape too
+    # (an empty {} or null update clears an admin-set capability).
+    _check_permissions_caller_permission(
+        permissions=update_key_request.permissions,
+        user_api_key_dict=user_api_key_dict,
+        field_was_set="permissions" in update_key_request.model_fields_set,
+    )
+
     # Custom key update hook
     if user_custom_key_update is not None:
         if inspect.iscoroutinefunction(user_custom_key_update):
@@ -2213,6 +2241,7 @@ async def _validate_update_key_data(
     _check_permissions_caller_permission(
         permissions=data.permissions,
         user_api_key_dict=user_api_key_dict,
+        field_was_set="permissions" in data.model_fields_set,
     )
 
     _validate_caller_can_change_key_ownership(
@@ -4455,6 +4484,7 @@ async def regenerate_key_fn(
             _check_permissions_caller_permission(
                 permissions=data.permissions,
                 user_api_key_dict=user_api_key_dict,
+                field_was_set="permissions" in data.model_fields_set,
             )
             _check_budget_limits_delegation_ceiling(
                 budget_limits=data.budget_limits,

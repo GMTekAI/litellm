@@ -13042,6 +13042,7 @@ async def test_update_key_non_admin_permissions_rejected(monkeypatch):
     from litellm.proxy.management_endpoints.key_management_endpoints import (
         _validate_update_key_data,
     )
+
     monkeypatch.setattr(
         "litellm.proxy.management_endpoints.key_management_endpoints.litellm.default_key_generate_params",
         None,
@@ -13059,9 +13060,7 @@ async def test_update_key_non_admin_permissions_rejected(monkeypatch):
         max_budget=10.0,
         spend=0.0,
     )
-    data = UpdateKeyRequest(
-        key="sk-alice", permissions={"allow_pii_controls": True}
-    )
+    data = UpdateKeyRequest(key="sk-alice", permissions={"allow_pii_controls": True})
     with pytest.raises(HTTPException) as exc_info:
         await _validate_update_key_data(
             data=data,
@@ -13077,6 +13076,120 @@ async def test_update_key_non_admin_permissions_rejected(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_update_key_non_admin_explicit_clear_rejected(monkeypatch):
+    """
+    Veria Medium follow-up: an explicit `permissions={}` (or null) from a
+    non-admin owner clears an admin-set capability such as
+    enable_llm_guard_check, so it must trip the gate too. The gate now keys
+    off `permissions in data.model_fields_set` rather than truthiness.
+    """
+    from litellm.proxy._types import LiteLLM_VerificationToken
+    from litellm.proxy.management_endpoints.key_management_endpoints import (
+        _validate_update_key_data,
+    )
+
+    monkeypatch.setattr(
+        "litellm.proxy.management_endpoints.key_management_endpoints.litellm.default_key_generate_params",
+        None,
+        raising=False,
+    )
+    owner = UserAPIKeyAuth(
+        user_role=LitellmUserRoles.INTERNAL_USER,
+        user_id="alice",
+        max_budget=10.0,
+    )
+    existing_key = LiteLLM_VerificationToken(
+        token="hashed-key",
+        user_id="alice",
+        created_by="alice",
+        max_budget=10.0,
+        spend=0.0,
+        permissions={"enable_llm_guard_check": True},
+    )
+    data = UpdateKeyRequest(key="sk-alice", permissions={})
+    assert "permissions" in data.model_fields_set
+    with pytest.raises(HTTPException) as exc_info:
+        await _validate_update_key_data(
+            data=data,
+            existing_key_row=existing_key,
+            user_api_key_dict=owner,
+            llm_router=None,
+            premium_user=False,
+            prisma_client=None,
+            user_api_key_cache=None,
+        )
+    assert exc_info.value.status_code == 403
+
+
+@pytest.mark.asyncio
+async def test_update_key_non_admin_permissions_omitted_allowed(monkeypatch):
+    """
+    Counterpart: a non-admin owner updating other fields without sending
+    permissions at all must still pass (the field is absent from
+    model_fields_set, so the gate does not fire).
+    """
+    from litellm.proxy._types import LiteLLM_VerificationToken
+    from litellm.proxy.management_endpoints.key_management_endpoints import (
+        _check_permissions_caller_permission,
+    )
+
+    owner = UserAPIKeyAuth(
+        user_role=LitellmUserRoles.INTERNAL_USER,
+        user_id="alice",
+        max_budget=10.0,
+    )
+    data = UpdateKeyRequest(key="sk-alice", metadata={"team": "data"})
+    assert "permissions" not in data.model_fields_set
+    _check_permissions_caller_permission(
+        permissions=data.permissions,
+        user_api_key_dict=owner,
+        field_was_set="permissions" in data.model_fields_set,
+    )
+
+
+@pytest.mark.asyncio
+async def test_bulk_update_non_admin_permissions_rejected(monkeypatch):
+    """
+    Veria Medium follow-up part B: /key/bulk_update and /team/key/bulk_update
+    drive _process_single_key_update directly, skipping
+    _validate_update_key_data and therefore the per-key /key/update gate.
+    The gate now lives inside _process_single_key_update so the bulk paths
+    are covered too.
+    """
+    from litellm.proxy._types import LiteLLM_VerificationToken
+    from litellm.proxy.management_endpoints.key_management_endpoints import (
+        _process_single_key_update,
+    )
+
+    owner = UserAPIKeyAuth(
+        user_role=LitellmUserRoles.INTERNAL_USER,
+        user_id="alice",
+        max_budget=10.0,
+    )
+    existing_key = LiteLLM_VerificationToken(
+        token="hashed-key",
+        user_id="alice",
+        created_by="alice",
+        max_budget=10.0,
+        spend=0.0,
+    )
+    data = UpdateKeyRequest(key="sk-alice", permissions={"get_spend_routes": True})
+    with pytest.raises(HTTPException) as exc_info:
+        await _process_single_key_update(
+            update_key_request=data,
+            user_api_key_dict=owner,
+            litellm_changed_by=None,
+            prisma_client=None,
+            user_api_key_cache=None,
+            proxy_logging_obj=None,
+            llm_router=None,
+            user_custom_key_update=None,
+            existing_key_row=existing_key,
+        )
+    assert exc_info.value.status_code == 403
+
+
+@pytest.mark.asyncio
 async def test_regenerate_key_non_admin_permissions_rejected():
     """
     VERIA-392 B2: /key/regenerate inherited the same hole as /key/generate
@@ -13086,6 +13199,7 @@ async def test_regenerate_key_non_admin_permissions_rejected():
     from litellm.proxy.management_endpoints.key_management_endpoints import (
         _check_permissions_caller_permission,
     )
+
     owner = UserAPIKeyAuth(
         user_role=LitellmUserRoles.INTERNAL_USER,
         user_id="alice",
@@ -13110,6 +13224,7 @@ async def test_regenerate_key_non_admin_budget_limits_rejected():
         _check_budget_limits_delegation_ceiling,
     )
     from litellm.models.team import BudgetLimitEntry
+
     owner = UserAPIKeyAuth(
         user_role=LitellmUserRoles.INTERNAL_USER,
         user_id="alice",
