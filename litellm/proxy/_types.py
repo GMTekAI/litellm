@@ -1008,6 +1008,15 @@ class LiteLLM_ObjectPermissionBase(LiteLLMPydanticObjectBase):
 from litellm.models.team import BudgetLimitEntry as BudgetLimitEntry  # noqa: E402
 
 
+class PermissionsDict(TypedDict, total=False):
+    """Plain-dict mirror of the `permissions` field on a key request. Names the
+    keys actually read by the proxy so callers and readers share one source of
+    truth; `total=False` lets forward-compat keys pass without a schema bump."""
+
+    allow_pii_controls: bool
+    get_spend_routes: bool
+
+
 class GenerateRequestBase(LiteLLMPydanticObjectBase):
     """
     Overlapping schema between key and user generate/update requests

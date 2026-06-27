@@ -548,7 +548,7 @@ def _check_allowed_routes_caller_permission(
 
 
 def _check_permissions_caller_permission(
-    permissions: Optional[dict],
+    permissions: Optional[PermissionsDict],
     user_api_key_dict: UserAPIKeyAuth,
 ) -> None:
     """
