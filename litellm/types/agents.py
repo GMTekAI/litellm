@@ -5,6 +5,7 @@ from pydantic import BaseModel, PrivateAttr
 from typing_extensions import Required, TypedDict
 
 from litellm.types.llms.base import LiteLLMPydanticObjectBase
+from litellm.types.object_permission import ObjectPermissionDict
 
 if TYPE_CHECKING:
     from a2a.types import SendMessageResponse
@@ -210,7 +211,7 @@ class AgentResponse(BaseModel):
     agent_name: str
     litellm_params: Optional[Dict[str, Any]] = None
     agent_card_params: Dict[str, Any]
-    object_permission: Optional[Dict[str, Any]] = None
+    object_permission: Optional[ObjectPermissionDict] = None
     spend: Optional[float] = None
     tpm_limit: Optional[int] = None
     rpm_limit: Optional[int] = None
