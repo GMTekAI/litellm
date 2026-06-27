@@ -2098,6 +2098,54 @@ async def _process_single_key_update(
                 prisma_client=prisma_client,
             )
 
+    is_ui_session_team_key = (
+        user_api_key_dict.team_id == UI_SESSION_TOKEN_TEAM_ID and update_key_request.team_id is not None
+    )
+    delegation_ceiling = (
+        user_api_key_dict.max_budget
+        if user_api_key_dict.max_budget is not None
+        else (team_obj.max_budget if user_api_key_dict.is_session_token and team_obj is not None else None)
+    )
+    if (
+        user_api_key_dict.is_session_token
+        and user_api_key_dict.user_role != LitellmUserRoles.PROXY_ADMIN.value
+        and not is_ui_session_team_key
+        and update_key_request.max_budget is not None
+        and team_obj is None
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error": (
+                    f"max_budget ({update_key_request.max_budget}) cannot be set without "
+                    "specifying team_id when using a CLI session token."
+                )
+            },
+        )
+    if (
+        user_api_key_dict.user_role != LitellmUserRoles.PROXY_ADMIN.value
+        and not is_ui_session_team_key
+        and update_key_request.max_budget is not None
+        and delegation_ceiling is not None
+        and update_key_request.max_budget > delegation_ceiling
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error": (
+                    f"max_budget ({update_key_request.max_budget}) cannot exceed the caller's "
+                    f"own max_budget ({delegation_ceiling})."
+                )
+            },
+        )
+    _check_budget_limits_delegation_ceiling(
+        budget_limits=update_key_request.budget_limits,
+        delegation_ceiling=delegation_ceiling,
+        user_api_key_dict=user_api_key_dict,
+        is_ui_session_team_key=is_ui_session_team_key,
+        team_table=team_obj,
+    )
+
     # Validate team change if team is being changed
     if is_different_team(data=update_key_request, existing_key_row=existing_key_row):
         if llm_router is None:

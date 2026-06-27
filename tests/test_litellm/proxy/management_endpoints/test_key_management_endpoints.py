@@ -11307,6 +11307,58 @@ async def test_bulk_update_team_keys_auth_check_runs_when_no_keys_match(monkeypa
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "update_fields,error_fragment",
+    [
+        ({"max_budget": 100.0}, "max_budget"),
+        (
+            {"budget_limits": [{"budget_duration": "1d", "max_budget": 100.0}]},
+            "budget_limits",
+        ),
+        (
+            {"budget_limits": [{"budget_duration": "1d", "max_budget": float("nan")}]},
+            "finite number",
+        ),
+    ],
+)
+async def test_bulk_update_team_keys_enforces_non_admin_budget_ceiling(monkeypatch, update_fields, error_fragment):
+    from litellm.proxy.management_endpoints.key_management_endpoints import (
+        bulk_update_team_keys,
+    )
+    from litellm.types.proxy.management_endpoints.key_management_endpoints import (
+        BulkUpdateTeamKeysRequest,
+        KeyUpdateFields,
+    )
+
+    update_data = AsyncMock(return_value={"data": _updated(update_fields)})
+    _setup_team_keys_mocks(
+        monkeypatch,
+        find_many=[_make_team_key("tok-a")],
+        update_data=update_data,
+    )
+
+    response = await bulk_update_team_keys(
+        data=BulkUpdateTeamKeysRequest(
+            team_id="team-abc",
+            key_ids=["tok-a"],
+            update_fields=KeyUpdateFields(**update_fields),
+        ),
+        user_api_key_dict=UserAPIKeyAuth(
+            user_role=LitellmUserRoles.INTERNAL_USER,
+            api_key="sk-iu",
+            user_id="iu",
+            max_budget=10.0,
+        ),
+        litellm_changed_by=None,
+    )
+
+    assert len(response.successful_updates) == 0
+    assert len(response.failed_updates) == 1
+    assert error_fragment in response.failed_updates[0].failed_reason
+    update_data.assert_not_called()
+
+
+@pytest.mark.asyncio
 async def test_bulk_update_team_keys_does_not_log_raw_sk_token_on_failure(
     monkeypatch, caplog
 ):
