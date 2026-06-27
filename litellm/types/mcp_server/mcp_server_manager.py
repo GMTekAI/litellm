@@ -64,6 +64,15 @@ class MCPServer(BaseModel):
     token_exchange_endpoint: Optional[str] = None
     audience: Optional[str] = None
     subject_token_type: str = "urn:ietf:params:oauth:token-type:access_token"
+    # ID-JAG fields (draft-ietf-oauth-identity-assertion-authz-grant).
+    # Leg 1 reuses token_exchange_endpoint (IdP org-AS), audience (resource-AS
+    # identifier), scopes, subject_token_type, client_id/client_secret. Leg 2
+    # posts the ID-JAG assertion to id_jag_resource_token_endpoint.
+    id_jag_resource_token_endpoint: Optional[str] = None
+    id_jag_resource: Optional[str] = None
+    client_private_key: Optional[str] = None
+    client_private_key_id: Optional[str] = None
+    client_assertion_signing_alg: str = "RS256"
     # Stdio-specific fields
     command: Optional[str] = None
     args: Optional[List[str]] = None
@@ -205,4 +214,19 @@ class MCPServer(BaseModel):
             self.auth_type == MCPAuth.oauth2_token_exchange
             and bool(self.client_id and self.client_secret)
             and bool(self.token_exchange_endpoint or self.token_url)
+        )
+
+    @property
+    def has_id_jag_config(self) -> bool:
+        """True if this server is configured for the two-legged ID-JAG flow.
+
+        Requires both authorization-server endpoints and a client-auth method
+        (private-key JWT or client_secret).
+        """
+        return (
+            self.auth_type == MCPAuth.oauth2_id_jag
+            and bool(self.client_id)
+            and bool(self.token_exchange_endpoint)
+            and bool(self.id_jag_resource_token_endpoint)
+            and bool(self.client_private_key or self.client_secret)
         )

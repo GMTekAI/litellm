@@ -100,8 +100,8 @@ def to_server_spec(server: MCPServer) -> Optional[ServerSpec]:
                 )
             # client_credentials (M2M) and delegate/passthrough oauth2 stay on v1
             return None
-        case MCPAuth.oauth2_token_exchange | MCPAuth.aws_sigv4:
-            return None  # token exchange and SigV4 are not migrated yet -> defer to v1
+        case MCPAuth.oauth2_token_exchange | MCPAuth.oauth2_id_jag | MCPAuth.aws_sigv4:
+            return None  # token exchange, ID-JAG, and SigV4 are not migrated yet -> defer to v1
     assert_never(auth_type)
 
 

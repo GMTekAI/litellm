@@ -26,7 +26,7 @@ from litellm.proxy.common_utils.encrypt_decrypt_utils import (
     decrypt_value_helper,
     encrypt_value_helper,
 )
-from litellm.proxy._experimental.mcp_server.auth import token_exchange
+from litellm.proxy._experimental.mcp_server.auth import id_jag, token_exchange
 from litellm.types.llms.custom_http import httpxSpecialProvider
 
 if TYPE_CHECKING:
@@ -281,12 +281,21 @@ async def resolve_mcp_auth(
 
     Priority:
     1. ``mcp_auth_header`` — per-request/per-user override
-    2. OAuth2 Token Exchange (OBO / RFC 8693) — exchange user token for scoped token
-    3. OAuth2 client_credentials token — auto-fetched and cached
-    4. ``server.authentication_token`` — static token from config/DB
+    2. ID-JAG (two-legged identity assertion grant) — exchange user token for MCP access token
+    3. OAuth2 Token Exchange (OBO / RFC 8693) — exchange user token for scoped token
+    4. OAuth2 client_credentials token — auto-fetched and cached
+    5. ``server.authentication_token`` — static token from config/DB
     """
     if mcp_auth_header:
         return mcp_auth_header
+    if server.has_id_jag_config:
+        if subject_token:
+            return await id_jag.mcp_id_jag_handler.exchange_token(subject_token, server)
+        verbose_logger.warning(
+            "MCP server '%s' is configured for ID-JAG but no subject_token was provided. "
+            "The request will proceed without authentication.",
+            server.server_id,
+        )
     if server.has_token_exchange_config:
         if subject_token:
             return await token_exchange.mcp_token_exchange_handler.exchange_token(
