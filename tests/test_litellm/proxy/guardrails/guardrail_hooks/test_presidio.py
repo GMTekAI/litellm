@@ -19,7 +19,7 @@ from litellm.proxy._types import UserAPIKeyAuth
 from litellm.proxy.guardrails.guardrail_hooks.presidio import (
     _OPTIONAL_PresidioPIIMasking,
 )
-from litellm.exceptions import GuardrailRaisedException
+from litellm.exceptions import BlockedPiiEntityError, GuardrailRaisedException
 from litellm.types.guardrails import LitellmParams, PiiAction, PiiEntityType
 from litellm.types.utils import Choices, Message, ModelResponse
 
@@ -3259,6 +3259,105 @@ async def test_mask_streaming_preserves_stream_on_check_pii_error():
         for chunk in collected
         for choice in getattr(chunk, "choices", [])
     ), "finish chunk dropped after a masking error"
+
+
+@pytest.mark.asyncio
+async def test_mask_streaming_error_preserves_tool_call_accumulators():
+    guardrail = _OPTIONAL_PresidioPIIMasking(mock_testing=True, apply_to_output=True)
+
+    async def mock_check_pii(text, output_parse_pii, presidio_config, request_data):
+        if "bad@example.com" in text:
+            raise RuntimeError("presidio down")
+        return text.replace("secret@example.com", "<EMAIL>")
+
+    guardrail.check_pii = mock_check_pii
+
+    def tool_chunk(*, id=None, name=None, args=None, finish_reason=None):
+        return ModelResponseStream(
+            id="chatcmpl-lit3222",
+            created=1,
+            model="gpt-4o-mini",
+            object="chat.completion.chunk",
+            choices=[
+                StreamingChoices(
+                    index=1,
+                    delta=(
+                        Delta(
+                            tool_calls=[
+                                ChatCompletionDeltaToolCall(
+                                    index=0,
+                                    id=id,
+                                    type="function" if id else None,
+                                    function=Function(name=name, arguments=args),
+                                )
+                            ]
+                        )
+                        if args is not None
+                        else Delta()
+                    ),
+                    finish_reason=finish_reason,
+                )
+            ],
+        )
+
+    async def stream():
+        yield tool_chunk(
+            id="call_1",
+            name="save",
+            args='{"email": "secret@example.com"}',
+        )
+        yield _content_chunk("bad@example.com", index=0, finish_reason="stop")
+        yield tool_chunk(finish_reason="tool_calls")
+
+    collected = await _drive(guardrail, stream(), {"metadata": {}})
+    tool_args = [
+        tc.function.arguments
+        for chunk in collected
+        for choice in chunk.choices
+        for tc in (getattr(choice.delta, "tool_calls", None) or [])
+    ]
+
+    assert tool_args == ['{"email": "<EMAIL>"}']
+
+
+@pytest.mark.asyncio
+async def test_mask_emit_decision_caps_buffer_when_stability_fails():
+    guardrail = _OPTIONAL_PresidioPIIMasking(mock_testing=True, apply_to_output=True)
+    guardrail._stream_mask_margin = 3
+    guardrail._stream_mask_max_buffer = 6
+
+    async def unstable_transform(text):
+        return text[::-1]
+
+    emitted, held = await guardrail._mask_emit_decision(
+        "abcdefghij", False, unstable_transform
+    )
+
+    assert emitted == ""
+    assert held == "hij"
+
+
+@pytest.mark.parametrize(
+    "exception",
+    [
+        BlockedPiiEntityError(entity_type="EMAIL_ADDRESS", guardrail_name="presidio"),
+        GuardrailRaisedException(guardrail_name="presidio", message="invalid response"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_mask_streaming_propagates_guardrail_interventions(exception):
+    guardrail = _OPTIONAL_PresidioPIIMasking(mock_testing=True, apply_to_output=True)
+
+    async def mock_check_pii(text, output_parse_pii, presidio_config, request_data):
+        raise exception
+
+    guardrail.check_pii = mock_check_pii
+
+    async def stream():
+        yield _content_chunk("blocked", finish_reason="stop")
+
+    with pytest.raises(type(exception)):
+        await _drive(guardrail, stream(), {"metadata": {}})
 
 
 @pytest.mark.asyncio

@@ -77,10 +77,9 @@ from litellm.utils import (
 # calls. It bounds the largest single entity the incremental path can mask
 # without leaking; an entity longer than this could still be split.
 _PRESIDIO_STREAM_MARGIN = 96
-# Hard cap on buffered un-emitted output. Past this with no sentence boundary the
-# buffer is cut a margin back from its end (under the same stability check) to
-# bound memory and TTFT, while the trailing margin keeps any unfinished entity
-# buffered for the next chunk so the forced flush still never splits one.
+# Hard cap on buffered un-emitted output. Past this with no sentence boundary,
+# stable prefixes are flushed; if stability cannot be proven, the ambiguous
+# prefix is dropped while retaining the trailing margin.
 _PRESIDIO_STREAM_MAX_BUFFER = 2000
 
 
@@ -1227,30 +1226,42 @@ class _OPTIONAL_PresidioPIIMasking(CustomGuardrail):
         entity overlapping the cut is present in full when the buffer is analyzed,
         so a straddling entity makes the prefixes differ and the cut is held.
         Past ``_PRESIDIO_STREAM_MAX_BUFFER`` with no sentence boundary the buffer
-        is cut a margin back from its end under the same stability check, so the
-        forced flush still never splits an entity (the trailing margin keeps the
-        unfinished entity buffered for the next chunk)."""
+        first tries stable forced cuts and then drops the ambiguous prefix while
+        retaining the trailing margin, so a failed stability check cannot grow
+        the held buffer without bound."""
         if terminal:
             return (await transform(buffer) if buffer else ""), ""
         margin = self._stream_mask_margin
+        forced_cut = (
+            len(buffer) - margin
+            if len(buffer) > self._stream_mask_max_buffer and len(buffer) > margin
+            else None
+        )
         cuts = [
             index
             for index in self._mask_boundaries(buffer)
             if len(buffer) - index >= margin
         ]
-        if len(buffer) > self._stream_mask_max_buffer and len(buffer) > margin:
+        if forced_cut is not None:
             verbose_proxy_logger.warning(
                 "Presidio apply_to_output: buffered %d streamed chars with no "
-                "sentence boundary; flushing a margin-safe prefix to bound memory.",
+                "sentence boundary; bounding held stream state.",
                 len(buffer),
             )
-            cuts.append(len(buffer) - margin)
+            cuts.append(forced_cut)
+            cuts.extend(
+                index
+                for index in range(forced_cut, len(buffer))
+                if buffer[index].isspace()
+            )
         if cuts:
             masked_full = await transform(buffer)
             for index in sorted(set(cuts), reverse=True):
                 masked_prefix = await transform(buffer[:index])
                 if masked_full.startswith(masked_prefix):
                     return masked_prefix, buffer[index:]
+        if forced_cut is not None:
+            return "", buffer[forced_cut:]
         return "", buffer
 
     @staticmethod
@@ -1372,15 +1383,17 @@ class _OPTIONAL_PresidioPIIMasking(CustomGuardrail):
 
             if terminal:
                 built_tool_calls = await self._build_tool_calls(
-                    tool_acc.pop(index, {}), transform
+                    tool_acc.get(index, {}), transform
+                )
+                built_function_call = await self._build_function_call(
+                    func_acc.get(index), transform
                 )
                 if built_tool_calls:
                     delta.tool_calls = built_tool_calls
-                built_function_call = await self._build_function_call(
-                    func_acc.pop(index, None), transform
-                )
                 if built_function_call is not None:
                     delta.function_call = built_function_call
+                tool_acc.pop(index, None)
+                func_acc.pop(index, None)
 
     @staticmethod
     async def _build_tail_chunk(
@@ -1481,6 +1494,8 @@ class _OPTIONAL_PresidioPIIMasking(CustomGuardrail):
                     last_chunk, content_buffers, tool_acc, func_acc, transform
                 )
             except Exception as e:
+                if self._is_guardrail_intervention(e):
+                    raise
                 verbose_proxy_logger.error(
                     f"Error masking streaming PII tail: {str(e)}"
                 )
@@ -1519,6 +1534,8 @@ class _OPTIONAL_PresidioPIIMasking(CustomGuardrail):
                         emit_content,
                     )
                 except Exception as e:
+                    if self._is_guardrail_intervention(e):
+                        raise
                     # Fail closed: a transient masking error redacts this chunk's
                     # content (so possibly-unmasked PII never reaches the client)
                     # but keeps its finish_reason and keeps the stream flowing,
@@ -1527,9 +1544,6 @@ class _OPTIONAL_PresidioPIIMasking(CustomGuardrail):
                     verbose_proxy_logger.error(
                         f"Error masking streaming PII chunk: {str(e)}"
                     )
-                    content_buffers.clear()
-                    tool_acc.clear()
-                    func_acc.clear()
                     yield self._redacted_chunk(chunk)
                     continue
                 yield chunk
@@ -1544,6 +1558,8 @@ class _OPTIONAL_PresidioPIIMasking(CustomGuardrail):
                     "events). Output PII masking was skipped for this response."
                 )
         except Exception as e:
+            if self._is_guardrail_intervention(e):
+                raise
             verbose_proxy_logger.error(f"Error masking streaming PII output: {str(e)}")
 
     @staticmethod
