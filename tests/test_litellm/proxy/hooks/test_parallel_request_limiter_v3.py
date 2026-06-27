@@ -18,6 +18,9 @@ from litellm import Router
 from litellm.caching.caching import DualCache
 from litellm.proxy._types import UserAPIKeyAuth
 from litellm.proxy.hooks.parallel_request_limiter_v3 import (
+    TPM_RESERVED_SCOPES_KEY,
+    TPM_RESERVED_TOKENS_KEY,
+    TPM_TAG_SCOPES_KEY,
     _PROXY_MaxParallelRequestsHandler_v3 as _PROXY_MaxParallelRequestsHandler,
 )
 from litellm.proxy.utils import InternalUsageCache, ProxyLogging, hash_token
@@ -3537,3 +3540,184 @@ async def test_pre_call_hook_skips_reservation_when_disabled(monkeypatch):
     )
 
     assert TPM_RESERVED_TOKENS_KEY not in (data.get("metadata") or {})
+
+
+@pytest.mark.asyncio
+async def test_per_tag_rate_limit_independent_counters_v3(monkeypatch):
+    """
+    A single key with per-tag RPM limits tracks each tag independently: a tag
+    at its limit returns 429 while a different (unlimited) tag keeps flowing,
+    governed only by the generous key-level limit.
+    """
+    monkeypatch.setenv("LITELLM_RATE_LIMIT_WINDOW_SIZE", "60")
+    _api_key = hash_token("sk-per-tag-rpm")
+    user_api_key_dict = UserAPIKeyAuth(
+        api_key=_api_key,
+        rpm_limit=100,
+        metadata={"tag_rpm_limit": {"cell-1": 2}},
+    )
+    local_cache = DualCache()
+    handler = _PROXY_MaxParallelRequestsHandler(
+        internal_usage_cache=InternalUsageCache(local_cache)
+    )
+
+    async def call(tag: str) -> None:
+        await handler.async_pre_call_hook(
+            user_api_key_dict=user_api_key_dict,
+            cache=local_cache,
+            data={"model": "gpt-3.5-turbo", "metadata": {"tags": [tag]}},
+            call_type="",
+        )
+
+    await call("cell-1")
+    await call("cell-1")
+    with pytest.raises(HTTPException) as exc_info:
+        await call("cell-1")
+    assert exc_info.value.status_code == 429
+    assert "tag_per_key" in str(exc_info.value.detail)
+
+    # cell-2 has no configured tag limit, so cell-1's exhausted counter must
+    # not block it; only the generous key-level limit applies.
+    for _ in range(5):
+        await call("cell-2")
+
+
+@pytest.mark.asyncio
+async def test_per_tag_descriptor_creation_v3():
+    """
+    _create_rate_limit_descriptors emits a tag_per_key descriptor carrying both
+    RPM and TPM limits only for request tags present in the configured maps.
+    """
+    _api_key = hash_token("sk-per-tag-desc")
+    user_api_key_dict = UserAPIKeyAuth(
+        api_key=_api_key,
+        metadata={
+            "tag_rpm_limit": {"cell-1": 5},
+            "tag_tpm_limit": {"cell-1": 500},
+        },
+    )
+    handler = _PROXY_MaxParallelRequestsHandler(
+        internal_usage_cache=InternalUsageCache(DualCache())
+    )
+
+    descriptors = handler._create_rate_limit_descriptors(
+        user_api_key_dict=user_api_key_dict,
+        data={"model": "gpt-3.5-turbo", "metadata": {"tags": ["cell-1", "cell-2"]}},
+        rpm_limit_type=None,
+        tpm_limit_type=None,
+        model_has_failures=False,
+    )
+
+    tag_descriptors = [d for d in descriptors if d["key"] == "tag_per_key"]
+    assert len(tag_descriptors) == 1, "only the configured tag yields a descriptor"
+    descriptor = tag_descriptors[0]
+    assert descriptor["value"] == f"{_api_key}:cell-1"
+    assert descriptor["rate_limit"]["requests_per_unit"] == 5
+    assert descriptor["rate_limit"]["tokens_per_unit"] == 500
+
+
+@pytest.mark.asyncio
+async def test_per_tag_descriptor_absent_without_config_v3():
+    """No tag_per_key descriptor is created when the key has no tag limits."""
+    user_api_key_dict = UserAPIKeyAuth(
+        api_key=hash_token("sk-no-tag"),
+        rpm_limit=10,
+    )
+    handler = _PROXY_MaxParallelRequestsHandler(
+        internal_usage_cache=InternalUsageCache(DualCache())
+    )
+
+    descriptors = handler._create_rate_limit_descriptors(
+        user_api_key_dict=user_api_key_dict,
+        data={"model": "gpt-3.5-turbo", "metadata": {"tags": ["cell-1"]}},
+        rpm_limit_type=None,
+        tpm_limit_type=None,
+        model_has_failures=False,
+    )
+
+    assert not [d for d in descriptors if d["key"] == "tag_per_key"]
+
+
+def test_collect_tpm_scope_targets_uses_stashed_tag_scopes_v3():
+    """
+    Per-tag :tokens scopes are reconciled from the pre-call stash (only tags
+    with a configured limit), not from every request tag, so a key without tag
+    limits never writes a per-tag token counter for its tagged requests.
+    """
+    handler = _PROXY_MaxParallelRequestsHandler(
+        internal_usage_cache=InternalUsageCache(DualCache())
+    )
+    _api_key = hash_token("sk-tag-tpm-scope")
+    tag_value = f"{_api_key}:cell-1"
+
+    # No stash -> no tag scope even though the request carries tags.
+    without_stash = handler._collect_tpm_scope_targets(
+        standard_logging_metadata={"user_api_key_hash": _api_key},
+        kwargs={"standard_logging_object": {"request_tags": ["cell-1", "cell-2"]}},
+        model_group="gpt-3.5-turbo",
+    )
+    assert not [t for t in without_stash if t[0] == "tag_per_key"]
+
+    # Stash present -> exactly the limited tag scope is reconciled.
+    with_stash = handler._collect_tpm_scope_targets(
+        standard_logging_metadata={"user_api_key_hash": _api_key},
+        kwargs={
+            "litellm_params": {
+                "metadata": {TPM_TAG_SCOPES_KEY: [["tag_per_key", tag_value]]}
+            }
+        },
+        model_group="gpt-3.5-turbo",
+    )
+    assert ("tag_per_key", tag_value) in with_stash
+
+
+def test_per_tag_tpm_reconciled_in_both_reservation_modes_v3():
+    """
+    A tag with a configured TPM limit settles its counter to actual usage in
+    both modes: with reservation it applies the (actual - reserved) delta; with
+    reservation disabled (no reserved scope) it charges the full actual usage.
+    The legacy-mode branch is the one that silently bypassed the limit before
+    the per-tag scopes were stashed mode-independently.
+    """
+    handler = _PROXY_MaxParallelRequestsHandler(
+        internal_usage_cache=InternalUsageCache(DualCache())
+    )
+    _api_key = hash_token("sk-tag-tpm-recon")
+    tag_value = f"{_api_key}:cell-1"
+    response_obj = ModelResponse(
+        usage=Usage(prompt_tokens=10, completion_tokens=20, total_tokens=30)
+    )
+
+    reservation_kwargs = {
+        "standard_logging_object": {"metadata": {"user_api_key_hash": _api_key}},
+        "litellm_params": {
+            "metadata": {
+                TPM_TAG_SCOPES_KEY: [["tag_per_key", tag_value]],
+                TPM_RESERVED_TOKENS_KEY: 50,
+                TPM_RESERVED_SCOPES_KEY: [["tag_per_key", tag_value]],
+            }
+        },
+    }
+    reservation_ops = handler._build_success_event_pipeline_operations(
+        kwargs=reservation_kwargs, response_obj=response_obj, rate_limit_type="total"
+    )
+    reservation_tag = [
+        op for op in reservation_ops if op["key"].endswith(f"{tag_value}}}:tokens")
+    ]
+    assert len(reservation_tag) == 1
+    assert reservation_tag[0]["increment_value"] == -20  # 30 actual - 50 reserved
+
+    legacy_kwargs = {
+        "standard_logging_object": {"metadata": {"user_api_key_hash": _api_key}},
+        "litellm_params": {
+            "metadata": {TPM_TAG_SCOPES_KEY: [["tag_per_key", tag_value]]}
+        },
+    }
+    legacy_ops = handler._build_success_event_pipeline_operations(
+        kwargs=legacy_kwargs, response_obj=response_obj, rate_limit_type="total"
+    )
+    legacy_tag = [
+        op for op in legacy_ops if op["key"].endswith(f"{tag_value}}}:tokens")
+    ]
+    assert len(legacy_tag) == 1
+    assert legacy_tag[0]["increment_value"] == 30  # full actual, no reservation

@@ -31,7 +31,12 @@ from litellm.litellm_core_utils.prompt_templates.common_utils import (
     get_str_from_messages,
 )
 from litellm.proxy._types import UserAPIKeyAuth
-from litellm.proxy.auth.auth_utils import get_model_rate_limit_from_metadata
+from litellm.proxy.auth.auth_utils import (
+    get_key_tag_rpm_limit,
+    get_key_tag_tpm_limit,
+    get_model_rate_limit_from_metadata,
+)
+from litellm.proxy.common_utils.http_parsing_utils import get_tags_from_request_body
 from litellm.proxy.common_utils.proxy_rate_limit_error import (
     ProxyRateLimitError,
     map_v3_rate_limit_type,
@@ -239,6 +244,12 @@ TPM_RESERVED_SCOPES_KEY = "_litellm_tpm_reserved_scopes"
 # does not double-refund.
 TPM_RESERVATION_RELEASED_KEY = "_litellm_tpm_reservation_released"
 RATE_LIMIT_DESCRIPTORS_KEY = "_litellm_rate_limit_descriptors"
+# Stash for the (scope_key, scope_value) pairs of every tag_per_key descriptor
+# that carries a TPM limit on this request. Mode-independent: post-call
+# reconciliation enumerates these scopes so per-tag :tokens counters are
+# settled under both the reservation and the legacy post-call charge path,
+# while keys without tag limits never write a per-tag counter.
+TPM_TAG_SCOPES_KEY = "_litellm_tpm_tag_scopes"
 # Stash keys live ONLY in metadata channels — never at the top level of the
 # request body. Top-level keys are forwarded as body params to upstream
 # providers, which reject unknown fields with 400/429 errors.
@@ -248,6 +259,7 @@ _LITELLM_STASH_KEYS: Tuple[str, ...] = (
     TPM_RESERVED_SCOPES_KEY,
     TPM_RESERVATION_RELEASED_KEY,
     RATE_LIMIT_DESCRIPTORS_KEY,
+    TPM_TAG_SCOPES_KEY,
 )
 
 
@@ -1392,6 +1404,66 @@ class _PROXY_MaxParallelRequestsHandler_v3(CustomLogger):
             )
         )
 
+    def _add_tag_per_key_rate_limit_descriptor(
+        self,
+        user_api_key_dict: UserAPIKeyAuth,
+        data: dict,
+        descriptors: list[RateLimitDescriptor],
+    ) -> None:
+        """
+        Add per-request-tag rate limit descriptors for the API key.
+
+        Each tag carried on the request that has a configured limit gets its own
+        ``{api_key}:{tag}`` counter, so a burst on one tag/group never consumes
+        another's budget. Tags without a configured limit fall through to the
+        key-level descriptor.
+        """
+        if not user_api_key_dict.api_key:
+            return
+
+        tag_rpm_limit = get_key_tag_rpm_limit(user_api_key_dict) or {}
+        tag_tpm_limit = get_key_tag_tpm_limit(user_api_key_dict) or {}
+        if not tag_rpm_limit and not tag_tpm_limit:
+            return
+
+        for tag in dict.fromkeys(get_tags_from_request_body(data)):
+            rpm_limit = tag_rpm_limit.get(tag)
+            tpm_limit = tag_tpm_limit.get(tag)
+            if rpm_limit is None and tpm_limit is None:
+                continue
+            descriptors.append(
+                RateLimitDescriptor(
+                    key="tag_per_key",
+                    value=f"{user_api_key_dict.api_key}:{tag}",
+                    rate_limit={
+                        "requests_per_unit": rpm_limit,
+                        "tokens_per_unit": tpm_limit,
+                        "window_size": self.window_size,
+                    },
+                )
+            )
+
+    def _stash_tpm_tag_scopes(
+        self,
+        data: dict,
+        descriptors: list[RateLimitDescriptor],
+    ) -> None:
+        """
+        Stash the (key, value) of every tag_per_key descriptor that carries a
+        TPM limit so the success/failure callbacks can reconcile those counters
+        in both the reservation and legacy post-call modes.
+        """
+        tag_scopes = [
+            [d["key"], d["value"]]
+            for d in descriptors
+            if d["key"] == "tag_per_key"
+            and (d.get("rate_limit") or {}).get("tokens_per_unit") is not None
+        ]
+        if tag_scopes:
+            self._stash_value_in_metadata_channels(
+                data=data, key=TPM_TAG_SCOPES_KEY, value=tag_scopes
+            )
+
     def _add_mcp_per_key_rate_limit_descriptor(
         self,
         user_api_key_dict: UserAPIKeyAuth,
@@ -1741,6 +1813,13 @@ class _PROXY_MaxParallelRequestsHandler_v3(CustomLogger):
         self._add_model_per_key_rate_limit_descriptor(
             user_api_key_dict=user_api_key_dict,
             requested_model=requested_model,
+            descriptors=descriptors,
+        )
+
+        # Per-request-tag rate limits scoped to this key
+        self._add_tag_per_key_rate_limit_descriptor(
+            user_api_key_dict=user_api_key_dict,
+            data=data,
             descriptors=descriptors,
         )
 
@@ -2118,6 +2197,11 @@ class _PROXY_MaxParallelRequestsHandler_v3(CustomLogger):
                 user_api_key_dict, requested_model
             )
         )
+
+        # Record the per-tag TPM scopes so post-call reconciliation can settle
+        # their counters regardless of whether the reservation path runs.
+        self._stash_tpm_tag_scopes(data=data, descriptors=descriptors)
+
         # Only check rate limits if we have descriptors with actual limits
         if descriptors:
             # First pass: RPM and max_parallel_requests sliding-window check.
@@ -2693,7 +2777,35 @@ class _PROXY_MaxParallelRequestsHandler_v3(CustomLogger):
             targets.append(("agent", agent_id))
             if session_id:
                 targets.append(("agent_session", f"{agent_id}:{session_id}"))
+        # Per-tag scopes come from the pre-call stash (only tags with a
+        # configured TPM limit), so they reconcile in both the reservation and
+        # legacy post-call modes without writing counters for unlimited tags.
+        targets.extend(self._get_tpm_tag_scopes_from_kwargs(kwargs))
         return targets
+
+    @classmethod
+    def _get_tpm_tag_scopes_from_kwargs(
+        cls,
+        kwargs: Any,
+        standard_logging_metadata: Optional[dict[str, Any]] = None,
+    ) -> list[tuple[str, str]]:
+        """Resolve the per-tag TPM scopes stashed at pre-call (deduplicated)."""
+        candidate = cls._lookup_stashed_value(
+            kwargs, standard_logging_metadata, TPM_TAG_SCOPES_KEY
+        )
+        if not isinstance(candidate, list):
+            return []
+        scopes: list[tuple[str, str]] = []
+        for entry in candidate:
+            if (
+                isinstance(entry, (list, tuple))
+                and len(entry) == 2
+                and isinstance(entry[0], str)
+                and isinstance(entry[1], str)
+                and (entry[0], entry[1]) not in scopes
+            ):
+                scopes.append((entry[0], entry[1]))
+        return scopes
 
     def _build_reservation_aware_tpm_ops(
         self,
