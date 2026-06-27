@@ -276,6 +276,19 @@ class TestMCPClient:
         assert "Authorization" in headers
         assert headers["Authorization"] == "token my-secret-token"
 
+    def test_id_jag_auth_header_generation(self):
+        """ID-JAG resolves to a scoped access token that is sent as a Bearer header."""
+        client = MCPClient(
+            server_url="http://example.com/sse",
+            transport_type="sse",
+            auth_type=MCPAuth.oauth2_id_jag,
+            auth_value="idjag-access-token",
+        )
+
+        headers = client._get_auth_headers()
+
+        assert headers["Authorization"] == "Bearer idjag-access-token"
+
     def test_token_auth_compatibility_with_existing_auth_types(self):
         """Verify existing auth types are not affected by token auth addition"""
         # Test bearer token

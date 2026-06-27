@@ -415,10 +415,18 @@ def test_has_id_jag_config_false_wrong_auth_type():
     )
 
 
+def test_has_id_jag_config_false_missing_leg1_endpoint():
+    assert _id_jag_server(token_exchange_endpoint=None).has_id_jag_config is False
+
+
 def test_has_id_jag_config_false_missing_leg2_endpoint():
     assert (
         _id_jag_server(id_jag_resource_token_endpoint=None).has_id_jag_config is False
     )
+
+
+def test_has_id_jag_config_false_missing_client_id():
+    assert _id_jag_server(client_id=None).has_id_jag_config is False
 
 
 def test_has_id_jag_config_false_no_client_auth():
