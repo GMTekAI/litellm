@@ -10,6 +10,7 @@ enumerated few. Nothing here reads request data; callers pass admin-resolved
 credential values only.
 """
 
+import os
 from typing import Callable, Mapping, Optional
 
 from litellm.constants import LITELLM_LOGGING_CREDENTIAL_NAME_KEY
@@ -55,7 +56,17 @@ def _arize_destination(values: Mapping[str, str]) -> Optional[OtelDestination]:
     if not space or not api_key:
         return None
     endpoint = values.get("arize_endpoint") or "https://otlp.arize.com/v1"
-    project = values.get("arize_project_name") or values.get("project_name")
+    # Arize routes a trace to a project via the ``model_id`` Resource attribute
+    # (OpenInference convention), NOT an auth header like langfuse/weave do, so the
+    # project must ride the span Resource. Prefer the credential's own project, then
+    # fall back to the proxy-global ``ARIZE_PROJECT_NAME`` so an arize credential
+    # that omits the project still lands somewhere deterministic. Backends that route
+    # by header declare no resource_attributes; this stays arize-local.
+    project = (
+        values.get("arize_project_name")
+        or values.get("project_name")
+        or os.environ.get("ARIZE_PROJECT_NAME")
+    )
     resource_attributes = (
         {"model_id": project, "arize.project.name": project} if project else {}
     )

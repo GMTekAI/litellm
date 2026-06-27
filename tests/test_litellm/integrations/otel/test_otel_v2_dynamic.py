@@ -226,15 +226,19 @@ def test_clone_config_carries_destination_resource_attrs():
     assert new.resource_attributes["arize.project.name"] == "team-b-proj"
 
 
-def test_clone_config_uses_arize_env_fallback(monkeypatch):
-    """A destination with no explicit resource_attributes but the arize backend
-    falls back to ARIZE_PROJECT_NAME -- the SAME fallback the fan-out path uses,
-    so the gen-AI span and its parents still agree on the Resource."""
+def test_clone_config_carries_builder_declared_resource_attrs(monkeypatch):
+    """End-to-end: an arize credential that omits the project gets ARIZE_PROJECT_NAME
+    folded in at BUILD time (build_destination), and the clone config then carries
+    those Resource attrs generically -- the gen-AI span lands in the same project as
+    its fan-out'd parents. The clone path itself is backend-agnostic; it reads
+    whatever the builder declared."""
     monkeypatch.setenv("ARIZE_PROJECT_NAME", "env-proj")
+    from litellm.integrations.otel.presets.destinations import build_destination
+
+    dest = build_destination("arize", {"arize_space_id": "s", "arize_api_key": "k"})
+    assert dest is not None
     cache = _cache("arize")
-    new = cache._config_with_destinations(
-        (_dest("https://otlp.arize.com/v1", backend="arize"),)
-    )
+    new = cache._config_with_destinations((dest,))
     assert new.resource_attributes["model_id"] == "env-proj"
     assert new.resource_attributes["arize.project.name"] == "env-proj"
 

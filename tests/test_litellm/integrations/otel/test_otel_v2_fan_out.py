@@ -144,7 +144,11 @@ def test_fan_out_forwards_proxy_internal_spans_to_every_destination(monkeypatch)
     assert "auth" in names
 
 
-def test_arize_fan_out_uses_destination_project_over_env(monkeypatch):
+def test_destination_resource_attrs_reads_declared_attrs(monkeypatch):
+    """``destination_resource_attrs`` is backend-agnostic: it returns exactly what
+    the destination's builder declared, never consulting env itself. The env-vs-
+    credential precedence is enforced at build time (see test_presets_destinations),
+    so setting ARIZE_PROJECT_NAME here must NOT override the destination's own attrs."""
     monkeypatch.setenv("ARIZE_PROJECT_NAME", "global-project")
     destination = OtelDestination(
         callback_name="arize",
@@ -160,6 +164,17 @@ def test_arize_fan_out_uses_destination_project_over_env(monkeypatch):
         "model_id": "tenant-project",
         "arize.project.name": "tenant-project",
     }
+
+
+def test_destination_resource_attrs_empty_for_header_routed_backend():
+    """A langfuse/weave-style destination routes by header and declares no Resource
+    attrs; the helper returns {} and the fan-out leaves the span Resource untouched."""
+    destination = OtelDestination(
+        callback_name="langfuse_otel",
+        endpoint="https://cloud.langfuse.com/api/public/otel",
+        headers={"Authorization": "Basic x"},
+    )
+    assert destination_resource_attrs(destination) == {}
 
 
 def test_fan_out_skips_genai_span_to_avoid_double_export(monkeypatch):
