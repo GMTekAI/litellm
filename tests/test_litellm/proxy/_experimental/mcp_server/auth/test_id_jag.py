@@ -6,6 +6,7 @@ authentication, caching, error handling, resolve_mcp_auth integration, config/DB
 loading, and the has_id_jag_config property.
 """
 
+import asyncio
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
@@ -258,6 +259,63 @@ async def test_cached_skips_both_legs():
     assert mock_client.post.call_count == 2
 
 
+@pytest.mark.asyncio
+async def test_concurrent_calls_exchange_once():
+    """Two concurrent calls for the same subject_token share a single exchange;
+    the loser waits on the lock and serves from cache (2 POSTs total, not 4)."""
+    handler = IdJagHandler()
+    server = _id_jag_server()
+    responses = iter([_resp("idjag"), _resp("shared-access")])
+    call_count = 0
+
+    async def slow_post(url, data=None):
+        nonlocal call_count
+        call_count += 1
+        await asyncio.sleep(0.01)
+        return next(responses)
+
+    mock_client = AsyncMock()
+    mock_client.post = slow_post
+
+    with patch(
+        "litellm.proxy._experimental.mcp_server.auth.id_jag.get_async_httpx_client",
+        return_value=mock_client,
+    ):
+        results = await asyncio.gather(
+            handler.exchange_token("same-id-token", server),
+            handler.exchange_token("same-id-token", server),
+        )
+
+    assert results == ["shared-access", "shared-access"]
+    assert call_count == 2
+
+
+@pytest.mark.asyncio
+async def test_invalidate_forces_re_exchange():
+    """invalidate() drops the cached token so the next call exchanges again."""
+    handler = IdJagHandler()
+    server = _id_jag_server()
+    mock_client = AsyncMock()
+    mock_client.post.side_effect = [
+        _resp("idjag-1"),
+        _resp("access-1"),
+        _resp("idjag-2"),
+        _resp("access-2"),
+    ]
+
+    with patch(
+        "litellm.proxy._experimental.mcp_server.auth.id_jag.get_async_httpx_client",
+        return_value=mock_client,
+    ):
+        first = await handler.exchange_token("id-token", server)
+        handler.invalidate("id-token", server.server_id)
+        second = await handler.exchange_token("id-token", server)
+
+    assert first == "access-1"
+    assert second == "access-2"
+    assert mock_client.post.call_count == 4
+
+
 # ── Error handling ──
 
 
@@ -341,6 +399,16 @@ async def test_missing_endpoint_raises():
 
 
 @pytest.mark.asyncio
+async def test_missing_client_id_raises():
+    """A missing client_id raises ValueError before any HTTP call."""
+    handler = IdJagHandler()
+    server = _id_jag_server(client_id=None)
+
+    with pytest.raises(ValueError, match="missing client_id"):
+        await handler._do_exchange("user-id-token", server)
+
+
+@pytest.mark.asyncio
 async def test_missing_client_auth_raises():
     """No private key and no client_secret raises ValueError."""
     handler = IdJagHandler()
@@ -348,6 +416,24 @@ async def test_missing_client_auth_raises():
 
     with pytest.raises(ValueError, match="client_private_key or client_secret"):
         await handler._do_exchange("user-id-token", server)
+
+
+@pytest.mark.asyncio
+async def test_none_response_raises():
+    """A None response from the HTTP client raises ValueError rather than crashing."""
+    handler = IdJagHandler()
+    server = _id_jag_server()
+    mock_client = AsyncMock()
+    mock_client.post.return_value = None
+
+    with (
+        patch(
+            "litellm.proxy._experimental.mcp_server.auth.id_jag.get_async_httpx_client",
+            return_value=mock_client,
+        ),
+        pytest.raises(ValueError, match="returned no response"),
+    ):
+        await handler.exchange_token("user-id-token", server)
 
 
 # ── resolve_mcp_auth integration ──
