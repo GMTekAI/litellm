@@ -11383,6 +11383,13 @@ async def test_bulk_update_team_keys_enforces_non_admin_budget_ceiling(monkeypat
         find_many=[_make_team_key("tok-a")],
         update_data=update_data,
     )
+    # The shared admin gate fires first for non-admins; patch it to no-op
+    # so this test isolates the per-window ceiling / finite checks for the
+    # caller role that legitimately reaches them (team admin / org admin).
+    monkeypatch.setattr(
+        f"{_BULK_PKG}._check_key_admin_access",
+        AsyncMock(),
+    )
 
     response = await bulk_update_team_keys(
         data=BulkUpdateTeamKeysRequest(
