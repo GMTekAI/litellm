@@ -11122,12 +11122,58 @@ async def test_bulk_update_team_keys_team_member_with_permission(monkeypatch):
         monkeypatch,
         find_many=[key_a],
         find_unique=AsyncMock(return_value=key_a),
-        update_data=AsyncMock(return_value={"data": _updated({"max_budget": 50.0})}),
+        update_data=AsyncMock(return_value={"data": _updated({"tpm_limit": 100})}),
     )
     auth_check = AsyncMock()
     monkeypatch.setattr(
         f"{_BULK_PKG}.TeamMemberPermissionChecks.can_team_member_execute_key_management_endpoint",
         auth_check,
+    )
+
+    # Non-budget bulk edit: legitimate for a team member with the
+    # KEY_UPDATE grant. Budget-field edits via bulk require admin
+    # authorization on top of the team-member grant and are covered by
+    # the sibling test below.
+    response = await bulk_update_team_keys(
+        data=BulkUpdateTeamKeysRequest(
+            team_id="team-abc",
+            all_keys_in_team=True,
+            update_fields=KeyUpdateFields(tpm_limit=100),
+        ),
+        user_api_key_dict=_internal_user(),
+        litellm_changed_by=None,
+    )
+    assert len(response.successful_updates) == 1
+    # Upfront check + per-key check inside _process_single_key_update
+    assert auth_check.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_bulk_update_team_keys_team_member_budget_change_rejected(monkeypatch):
+    """
+    A team member with KEY_UPDATE permission can bulk-edit non-budget
+    fields, but budget changes (max_budget / spend / budget_limits) still
+    require team-admin / org-admin / proxy-admin status. The shared
+    _check_key_update_authorization helper enforces this for /key/update
+    and now for the bulk paths too.
+    """
+    from litellm.proxy.management_endpoints.key_management_endpoints import (
+        bulk_update_team_keys,
+    )
+    from litellm.types.proxy.management_endpoints.key_management_endpoints import (
+        BulkUpdateTeamKeysRequest,
+        KeyUpdateFields,
+    )
+
+    key_a = _make_team_key("tok-a")
+    mock = _setup_team_keys_mocks(
+        monkeypatch,
+        find_many=[key_a],
+        find_unique=AsyncMock(return_value=key_a),
+    )
+    monkeypatch.setattr(
+        f"{_BULK_PKG}.TeamMemberPermissionChecks.can_team_member_execute_key_management_endpoint",
+        AsyncMock(),
     )
 
     response = await bulk_update_team_keys(
@@ -11139,9 +11185,10 @@ async def test_bulk_update_team_keys_team_member_with_permission(monkeypatch):
         user_api_key_dict=_internal_user(),
         litellm_changed_by=None,
     )
-    assert len(response.successful_updates) == 1
-    # Upfront check + per-key check inside _process_single_key_update
-    assert auth_check.await_count == 2
+    assert len(response.successful_updates) == 0
+    assert len(response.failed_updates) == 1
+    assert "admins" in response.failed_updates[0].failed_reason
+    mock.update_data.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -13236,6 +13283,65 @@ async def test_bulk_update_non_admin_permissions_rejected(monkeypatch):
             user_custom_key_update=None,
             existing_key_row=existing_key,
         )
+    assert exc_info.value.status_code == 403
+
+
+@pytest.mark.asyncio
+async def test_bulk_update_non_admin_budget_limits_rejected(monkeypatch):
+    """
+    The /key/update path admin-gates budget changes (max_budget / spend /
+    budget_limits) via _check_key_admin_access inside _validate_update_key_data.
+    The bulk paths reach _process_single_key_update directly and used to skip
+    that gate, so a team member with KEY_UPDATE permission (not a team admin)
+    could ship update_fields.budget_limits=[{1d, $1M}] through the bulk path
+    and rewrite the per-window cap on any team key. The shared
+    _check_key_update_authorization helper now fires for the bulk path too.
+    """
+    from litellm.proxy._types import LiteLLM_VerificationToken
+    from litellm.proxy.management_endpoints.key_management_endpoints import (
+        _process_single_key_update,
+    )
+
+    team_member = UserAPIKeyAuth(
+        user_role=LitellmUserRoles.INTERNAL_USER,
+        user_id="bob",
+        team_id="team-x",
+        max_budget=100.0,
+    )
+    team_key = LiteLLM_VerificationToken(
+        token="hashed-team-key",
+        user_id="someone-else",
+        created_by="someone-else",
+        team_id="team-x",
+        max_budget=100.0,
+        spend=0.0,
+    )
+    data = UpdateKeyRequest(
+        key="sk-team-key",
+        budget_limits=[{"budget_duration": "1d", "max_budget": 1_000_000.0}],
+    )
+    with patch(
+        "litellm.proxy.management_endpoints.key_management_endpoints._check_key_admin_access",
+        new_callable=AsyncMock,
+        side_effect=HTTPException(status_code=403, detail={"error": "not authorized"}),
+    ):
+        with patch(
+            "litellm.proxy.management_endpoints.key_management_endpoints.TeamMemberPermissionChecks.can_team_member_execute_key_management_endpoint",
+            new_callable=AsyncMock,
+            return_value=None,
+        ):
+            with pytest.raises(HTTPException) as exc_info:
+                await _process_single_key_update(
+                    update_key_request=data,
+                    user_api_key_dict=team_member,
+                    litellm_changed_by=None,
+                    prisma_client=MagicMock(),
+                    user_api_key_cache=None,
+                    proxy_logging_obj=None,
+                    llm_router=None,
+                    user_custom_key_update=None,
+                    existing_key_row=team_key,
+                )
     assert exc_info.value.status_code == 403
 
 

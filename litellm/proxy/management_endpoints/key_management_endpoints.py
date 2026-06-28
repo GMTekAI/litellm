@@ -2058,13 +2058,22 @@ async def _process_single_key_update(
 
     # Bulk update entry point: /key/bulk_update and /team/key/bulk_update
     # construct UpdateKeyRequest objects and call this helper directly, so
-    # the per-key /key/update gate in _validate_update_key_data does not run.
-    # The same admin gate must apply here, and on the explicit-clear shape too
-    # (an empty {} or null update clears an admin-set capability).
+    # the per-key /key/update gates in _validate_update_key_data do not run.
+    # The same admin gates must apply here. permissions covers ambient
+    # capability self-grant (incl. explicit-clear); budget covers max_budget,
+    # spend, and per-window budget_limits writes.
     _check_permissions_caller_permission(
         permissions=update_key_request.permissions,
         user_api_key_dict=user_api_key_dict,
         field_was_set="permissions" in update_key_request.model_fields_set,
+    )
+    await _check_key_update_authorization(
+        data=update_key_request,
+        existing_key_row=existing_key_row,
+        user_api_key_dict=user_api_key_dict,
+        prisma_client=prisma_client,
+        user_api_key_cache=user_api_key_cache,
+        route_label="/key/bulk_update",
     )
 
     # Custom key update hook
@@ -2251,6 +2260,63 @@ async def _validate_mcp_servers_for_key_update(
     return normalized_object_permission
 
 
+async def _check_key_update_authorization(
+    data: UpdateKeyRequest,
+    existing_key_row: Any,
+    user_api_key_dict: UserAPIKeyAuth,
+    prisma_client: Any,
+    user_api_key_cache: Any,
+    route_label: str = "/key/update",
+) -> None:
+    """
+    Cross-key authorization for any update path. Two policies:
+
+    1. Non-budget fields on a key the caller owns (same user_id) or on a
+       team key the caller reached through `can_team_member_execute_key_management_endpoint`:
+       the personal-key / team-member fast path applies and no further
+       admin check is required.
+
+    2. Budget fields (max_budget / spend / budget_limits) always require
+       `_check_key_admin_access` (proxy admin, team admin, or org admin
+       over the key's team) regardless of ownership. The DB spend lags
+       the live cross-pod counter, so letting an "unchanged" spend
+       through the non-admin path would let a key owner overwrite the
+       live counter below real usage. `budget_limits` uses
+       `model_fields_set` so an explicit null/[] clears the field and
+       still trips the gate.
+
+    The /key/update handler invokes this through _validate_update_key_data;
+    the /key/bulk_update and /team/key/bulk_update handlers reach
+    _process_single_key_update directly, which also calls this helper so
+    the same admin gate applies to the bulk paths.
+    """
+    if user_api_key_dict.user_role == LitellmUserRoles.PROXY_ADMIN.value:
+        return
+    if prisma_client is None:
+        return
+    is_budget_change = (
+        (data.max_budget is not None and data.max_budget != existing_key_row.max_budget)
+        or data.spend is not None
+        or "budget_limits" in data.model_fields_set
+    )
+    caller_is_creator = (
+        user_api_key_dict.user_id is not None
+        and getattr(existing_key_row, "created_by", None) == user_api_key_dict.user_id
+        and getattr(existing_key_row, "user_id", None) == user_api_key_dict.user_id
+    )
+    key_is_team_key = getattr(existing_key_row, "team_id", None) is not None
+    can_skip_admin_check = (caller_is_creator or key_is_team_key) and not is_budget_change
+    if can_skip_admin_check:
+        return
+    await _check_key_admin_access(
+        user_api_key_dict=user_api_key_dict,
+        hashed_token=existing_key_row.token,
+        prisma_client=prisma_client,
+        user_api_key_cache=user_api_key_cache,
+        route=f"{route_label} (max_budget/spend)" if is_budget_change else route_label,
+    )
+
+
 async def _validate_update_key_data(
     data: UpdateKeyRequest,
     existing_key_row: Any,
@@ -2302,68 +2368,14 @@ async def _validate_update_key_data(
         user_api_key_cache=user_api_key_cache,
     )
 
-    # Cross-key authorization. Previously only gated on max_budget/spend
-    # changes, which let a non-admin blanket-rewrite any OTHER field on
-    # any key (models, alias, metadata, tpm_limit, rpm_limit,
-    # allowed_routes, guardrails, blocked, duration, permissions, …) as
-    # long as they avoided budget/spend.
-    #
-    # Policy:
-    # - Key owner (same user_id): may update non-budget fields on their
-    #   own key without the admin check.
-    # - Team member with /key/update grant (on a team key): may update
-    #   non-budget fields. Team membership + permission is already
-    #   enforced by can_team_member_execute_key_management_endpoint
-    #   above, which raises 401 for non-members or members without the
-    #   grant — so reaching this point on a team key means the caller
-    #   was authorized via member_permissions. This preserves the
-    #   documented member_permissions feature while still blocking the
-    #   cross-org attack (an outside org admin is not a member of the
-    #   victim team and gets rejected at the earlier check).
-    # - Anyone else (non-PROXY_ADMIN, not the owner, not a team member
-    #   on a team key): must pass _check_key_admin_access (PROXY_ADMIN
-    #   / key-owner / team-admin / org-admin of the key).
-    # - max_budget / spend / budget_limits: always require the admin
-    #   check, even for the key owner or a team member (matches the
-    #   existing admin-only budget semantics).  budget_limits uses
-    #   model_fields_set because an explicit null/[] clears the field
-    #   and must gate the same as setting or changing it.
-    # - spend gates on presence alone (not a value diff): the DB spend
-    #   lags the live cross-pod counter, so letting an "unchanged" spend
-    #   through the non-admin path would let a key owner / team member
-    #   overwrite the live counter below real usage and silently weaken
-    #   enforcement.
-    _is_budget_change = (
-        (data.max_budget is not None and data.max_budget != existing_key_row.max_budget)
-        or data.spend is not None
-        or "budget_limits" in data.model_fields_set
+    await _check_key_update_authorization(
+        data=data,
+        existing_key_row=existing_key_row,
+        user_api_key_dict=user_api_key_dict,
+        prisma_client=prisma_client,
+        user_api_key_cache=user_api_key_cache,
+        route_label="/key/update",
     )
-
-    # Personal-key bypass: the caller both created the key AND still owns it
-    # (user_id == caller).  Checking only created_by would let a demoted admin
-    # who originally created a key for another user continue editing it without
-    # admin authorization after the key was reassigned.
-    caller_is_creator = (
-        user_api_key_dict.user_id is not None
-        and getattr(existing_key_row, "created_by", None) == user_api_key_dict.user_id
-        and getattr(existing_key_row, "user_id", None) == user_api_key_dict.user_id
-    )
-    # Team keys: can_team_member_execute_key_management_endpoint (called above)
-    # already validated team membership + /key/update permission and would have
-    # raised if the caller lacked it.  Reaching this point on a team key for a
-    # non-budget change means the caller was authorized — skip the redundant
-    # _check_key_admin_access that would otherwise require team/org admin status.
-    _key_is_team_key = getattr(existing_key_row, "team_id", None) is not None
-    can_skip_admin_check = (caller_is_creator or _key_is_team_key) and not _is_budget_change
-    if (not _is_proxy_admin) and prisma_client is not None and not can_skip_admin_check:
-        hashed_key = existing_key_row.token
-        await _check_key_admin_access(
-            user_api_key_dict=user_api_key_dict,
-            hashed_token=hashed_key,
-            prisma_client=prisma_client,
-            user_api_key_cache=user_api_key_cache,
-            route=("/key/update (max_budget/spend)" if _is_budget_change else "/key/update"),
-        )
 
     # Check team limits if key has a team_id (from request or existing key)
     team_obj: Optional[LiteLLM_TeamTableCachedObj] = None
@@ -3550,7 +3562,7 @@ async def generate_key_helper_fn(
     update_key_values: Optional[dict] = None,
     key_alias: Optional[str] = None,
     allowed_cache_controls: Optional[list] = [],
-    permissions: Optional[PermissionsDict] = {},
+    permissions: Optional[PermissionsDict] = None,
     model_max_budget: Optional[dict] = {},
     model_rpm_limit: Optional[dict] = None,
     model_tpm_limit: Optional[dict] = None,
@@ -3615,7 +3627,10 @@ async def generate_key_helper_fn(
 
     aliases_json = json.dumps(aliases)
     config_json = json.dumps(config)
-    permissions_json = json.dumps(permissions)
+    # Preserve historical DB shape: serialize an empty dict (not None) when
+    # the caller passed no permissions, so downstream readers that expect a
+    # dict after json.loads continue to work.
+    permissions_json = json.dumps(permissions if permissions is not None else {})
     router_settings_json = safe_dumps(router_settings) if router_settings is not None else safe_dumps({})
 
     # Add model_rpm_limit and model_tpm_limit to metadata
