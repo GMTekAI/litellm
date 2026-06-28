@@ -9838,6 +9838,45 @@ class TestKeyOwnerPrivilegeEscalation:
         mock_check.assert_called_once()
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "update_kwargs,error_fragment",
+        [
+            ({"max_budget": 100.0}, "max_budget"),
+            (
+                {"budget_limits": [{"budget_duration": "1d", "max_budget": 100.0}]},
+                "budget_limits",
+            ),
+        ],
+    )
+    async def test_budget_admin_cannot_exceed_own_budget_ceiling_on_update(self, update_kwargs, error_fragment):
+        data = UpdateKeyRequest(key="sk-test", **update_kwargs)
+        existing = self._make_existing_key(created_by="creator-123")
+        auth = UserAPIKeyAuth(
+            user_id="creator-123",
+            user_role=LitellmUserRoles.INTERNAL_USER,
+            max_budget=10.0,
+        )
+
+        mock_check = AsyncMock()
+        with patch(
+            "litellm.proxy.management_endpoints.key_management_endpoints._check_key_admin_access",
+            mock_check,
+        ):
+            with pytest.raises(HTTPException) as exc_info:
+                await _validate_update_key_data(
+                    data=data,
+                    existing_key_row=existing,
+                    user_api_key_dict=auth,
+                    llm_router=None,
+                    premium_user=False,
+                    prisma_client=AsyncMock(),
+                    user_api_key_cache=MagicMock(),
+                )
+        assert exc_info.value.status_code == 400
+        assert error_fragment in str(exc_info.value.detail)
+        mock_check.assert_called_once()
+
+    @pytest.mark.asyncio
     @pytest.mark.parametrize("cleared_value", [[], None])
     async def test_creator_cannot_clear_own_budget_limits(self, cleared_value):
         """Clearing budget_limits is a budget change and requires admin."""

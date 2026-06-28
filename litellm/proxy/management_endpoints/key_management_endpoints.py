@@ -2410,6 +2410,51 @@ async def _validate_update_key_data(
                 prisma_client=prisma_client,
             )
 
+    is_ui_session_team_key = user_api_key_dict.team_id == UI_SESSION_TOKEN_TEAM_ID and data.team_id is not None
+    delegation_ceiling = (
+        user_api_key_dict.max_budget
+        if user_api_key_dict.max_budget is not None
+        else (team_obj.max_budget if user_api_key_dict.is_session_token and team_obj is not None else None)
+    )
+    if (
+        user_api_key_dict.is_session_token
+        and user_api_key_dict.user_role != LitellmUserRoles.PROXY_ADMIN.value
+        and not is_ui_session_team_key
+        and data.max_budget is not None
+        and team_obj is None
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error": (
+                    f"max_budget ({data.max_budget}) cannot be set without "
+                    "specifying team_id when using a CLI session token."
+                )
+            },
+        )
+    if (
+        user_api_key_dict.user_role != LitellmUserRoles.PROXY_ADMIN.value
+        and not is_ui_session_team_key
+        and data.max_budget is not None
+        and delegation_ceiling is not None
+        and data.max_budget > delegation_ceiling
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error": (
+                    f"max_budget ({data.max_budget}) cannot exceed the caller's own max_budget ({delegation_ceiling})."
+                )
+            },
+        )
+    _check_budget_limits_delegation_ceiling(
+        budget_limits=data.budget_limits,
+        delegation_ceiling=delegation_ceiling,
+        user_api_key_dict=user_api_key_dict,
+        is_ui_session_team_key=is_ui_session_team_key,
+        team_table=team_obj,
+    )
+
     # Validate key against project limits if project_id is being set
     _project_id_to_check = getattr(data, "project_id", None) or getattr(existing_key_row, "project_id", None)
     if _project_id_to_check is not None and (data.models is not None or data.max_budget is not None):
